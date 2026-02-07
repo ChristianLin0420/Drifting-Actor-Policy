@@ -1,0 +1,19 @@
+# =============================================================================
+# RLBench-Specific Requirements
+# =============================================================================
+# Additional dependencies for RLBench environment.
+# Note: PyRep and RLBench should be installed from source in Docker.
+# Note: Base requirements already installed in base Docker image.
+# =============================================================================
+
+# Robotics utilities
+natsort>=8.4.0
+pyquaternion>=0.9.9
+transforms3d>=0.4.1
+
+# Gymnasium (required by RLBench)
+gymnasium>=0.29.0
+
+# Additional simulation dependencies
+pybullet>=3.2.6
+

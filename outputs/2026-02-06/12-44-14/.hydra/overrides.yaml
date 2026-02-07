@@ -1,0 +1,10 @@
+- training.max_steps=30
+- training.use_fsdp=false
+- model.transformer.use_flash_attn=false
+- training.log_every_n_steps=5
+- training.eval_every_n_steps=15
+- training.wandb.mode=online
+- training.wandb.visualizations.drifting_field.frequency=5
+- training.wandb.visualizations.action_distribution.frequency=5
+- training.wandb.visualizations.kernel_similarity.frequency=10
+- training.wandb.visualizations.trajectory_3d.frequency=10

@@ -1,0 +1,38 @@
+# =============================================================================
+# Development Requirements
+# =============================================================================
+# Tools for testing, linting, and development.
+# =============================================================================
+
+# Include base requirements
+-r base.txt
+
+# Testing
+pytest>=8.0.0
+pytest-cov>=4.1.0
+pytest-xdist>=3.5.0
+
+# Code Quality
+black>=24.2.0
+ruff>=0.2.0
+isort>=5.13.0
+mypy>=1.8.0
+
+# Type Stubs
+types-Pillow
+types-tqdm
+
+# Documentation
+sphinx>=7.2.0
+sphinx-rtd-theme>=2.0.0
+sphinx-autodoc-typehints>=2.0.0
+
+# Jupyter
+jupyterlab>=4.1.0
+ipywidgets>=8.1.0
+
+# Profiling
+py-spy>=0.3.14
+memory-profiler>=0.61.0
+
+

@@ -1,0 +1,10 @@
+- data.tasks=[close_jar]
+- data.cameras=[front]
+- training.max_steps=20
+- training.use_fsdp=false
+- training.wandb.project=null
+- training.batch_size=4
+- training.num_workers=0
+- model.transformer.use_flash_attn=false
+- training.log_every_n_steps=5
+- training.eval_every_n_steps=10000

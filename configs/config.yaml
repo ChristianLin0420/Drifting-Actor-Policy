@@ -1,0 +1,17 @@
+# =============================================================================
+# Main Drifting-VLA Configuration
+# =============================================================================
+# This is the root config that composes model, training, and data configs.
+#
+# Usage:
+#   python scripts/train.py
+#   python scripts/train.py model=dit_l2 training=large_scale
+#   python scripts/train.py training.learning_rate=1e-4
+
+defaults:
+  - model: dit_b2
+  - training: baseline
+  - data: rlbench
+  - _self_
+
+

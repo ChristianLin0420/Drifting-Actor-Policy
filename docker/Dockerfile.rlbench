@@ -1,0 +1,164 @@
+# =============================================================================
+# Drifting-VLA RLBench Docker Image
+# =============================================================================
+# Extended image with CoppeliaSim, PyRep, and RLBench for robotic manipulation
+# simulation and data collection.
+#
+# Usage:
+#   docker build -f docker/Dockerfile.rlbench -t drifting-vla:rlbench .
+#
+# Run:
+#   docker run --gpus all --name drifting-vla-rlbench \
+#     -v $(pwd):/workspace --shm-size=16g \
+#     drifting-vla:rlbench python scripts/train.py
+#
+# Notes:
+#   - Xvfb auto-starts via entrypoint (headless rendering)
+#   - CoppeliaSim v4.1.0 (proven compatible with PyRep/RLBench)
+#   - WandB auto-login via WANDB_API_KEY env var
+# =============================================================================
+
+ARG BASE_IMAGE=drifting-vla:base
+FROM ${BASE_IMAGE}
+
+# =============================================================================
+# System Dependencies for CoppeliaSim + Qt + Headless Rendering
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Qt dependencies for CoppeliaSim
+    libqt5core5a \
+    libqt5gui5 \
+    libqt5widgets5 \
+    libqt5opengl5 \
+    qt5-qmake \
+    qtbase5-dev \
+    # Qt platform plugins (CRITICAL for headless)
+    libqt5x11extras5 \
+    qtwayland5 \
+    # XCB dependencies (required for Qt xcb plugin)
+    libxcb-cursor0 \
+    libxcb-xkb1 \
+    libxcb-glx0 \
+    libxcb-dri2-0 \
+    libxcb-dri3-0 \
+    libxcb-present0 \
+    libxcb-sync1 \
+    libxcb-util1 \
+    # Headless rendering
+    xvfb \
+    x11-utils \
+    # OpenGL/EGL for headless rendering
+    libegl1-mesa \
+    libegl1-mesa-dev \
+    libgl1-mesa-glx \
+    libgl1-mesa-dri \
+    libglu1-mesa \
+    mesa-utils \
+    # Additional graphics libraries
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    # Lua for CoppeliaSim scripts
+    liblua5.3-dev \
+    # Additional utilities
+    xdg-utils \
+    libxkbcommon-x11-0 \
+    libxcb-xinerama0 \
+    libxcb-icccm4 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-randr0 \
+    libxcb-render-util0 \
+    libxcb-shape0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# CoppeliaSim v4.1.0 Installation (proven compatible with PyRep/RLBench)
+# =============================================================================
+ENV COPPELIASIM_ROOT=/opt/CoppeliaSim
+
+# Download CoppeliaSim EDU v4.1.0 (Ubuntu 20.04 build, works on 22.04)
+RUN mkdir -p ${COPPELIASIM_ROOT} \
+    && cd /tmp \
+    && wget -q https://www.coppeliarobotics.com/files/V4_1_0/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz \
+    && tar -xf CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz -C ${COPPELIASIM_ROOT} --strip-components=1 \
+    && rm CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
+
+# CoppeliaSim environment
+ENV LD_LIBRARY_PATH="${COPPELIASIM_ROOT}:${LD_LIBRARY_PATH}"
+ENV PATH="${COPPELIASIM_ROOT}:${PATH}"
+# Qt plugin path — CRITICAL for headless rendering
+ENV QT_QPA_PLATFORM_PLUGIN_PATH="${COPPELIASIM_ROOT}"
+ENV QT_PLUGIN_PATH="${COPPELIASIM_ROOT}"
+ENV QT_QPA_PLATFORM=xcb
+ENV QT_X11_NO_MITSHM=1
+
+# =============================================================================
+# PyRep Installation (from source, compatible with CoppeliaSim 4.1)
+# =============================================================================
+RUN cd /tmp \
+    && git clone https://github.com/stepjam/PyRep.git \
+    && cd PyRep \
+    && pip install --no-cache-dir -e .
+
+# =============================================================================
+# RLBench Installation (from source)
+# =============================================================================
+RUN cd /tmp \
+    && git clone https://github.com/stepjam/RLBench.git \
+    && cd RLBench \
+    && pip install --no-cache-dir -e .
+
+# =============================================================================
+# Additional Python Dependencies
+# =============================================================================
+COPY requirements/rlbench.txt /tmp/rlbench.txt
+RUN pip install --no-cache-dir -r /tmp/rlbench.txt && rm /tmp/rlbench.txt
+
+# CoppeliaSim Python interface deps + image/video processing
+RUN pip install --no-cache-dir cbor2 pyzmq Pillow moviepy imageio imageio-ffmpeg
+
+# Install the project in editable mode
+COPY setup.py pyproject.toml /workspace/
+COPY drifting_vla/ /workspace/drifting_vla/
+RUN cd /workspace && pip install --no-cache-dir -e . || true
+
+# =============================================================================
+# Headless Rendering Environment
+# =============================================================================
+ENV DISPLAY=:99
+ENV LIBGL_ALWAYS_SOFTWARE=0
+ENV PYOPENGL_PLATFORM=egl
+
+# =============================================================================
+# WandB Configuration
+# Auto-login: set WANDB_API_KEY at runtime via:
+#   docker run -e WANDB_API_KEY=your_key ...
+# Or bake it into the image (less secure):
+#   ARG WANDB_API_KEY
+#   ENV WANDB_API_KEY=${WANDB_API_KEY}
+# =============================================================================
+# Fix git ownership warning for WandB
+RUN git config --global --add safe.directory /workspace
+
+# =============================================================================
+# Entrypoint: auto-start Xvfb + set DISPLAY
+# =============================================================================
+COPY docker/scripts/start_xvfb.sh /usr/local/bin/start_xvfb.sh
+RUN chmod +x /usr/local/bin/start_xvfb.sh || true
+
+RUN echo '#!/bin/bash\n\
+# Start Xvfb for headless CoppeliaSim rendering\n\
+Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &\n\
+sleep 2\n\
+export DISPLAY=:99\n\
+# Auto-login to WandB if API key is set\n\
+if [ -n "$WANDB_API_KEY" ]; then\n\
+    python -c "import wandb; wandb.login(key=\"$WANDB_API_KEY\", relogin=True)" 2>/dev/null\n\
+fi\n\
+exec "$@"' > /entrypoint.sh && chmod +x /entrypoint.sh
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]

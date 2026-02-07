@@ -1,0 +1,17 @@
+# =============================================================================
+# RLBench Dataset Configuration
+# =============================================================================
+# HuggingFace dataset: hqfang/rlbench-18-tasks (PerAct format)
+# Action format: [x, y, z, qx, qy, qz, qw, gripper] (8-dim)
+
+data_dir: './data/rlbench'
+
+tasks:
+  - close_jar
+
+cameras:
+  - front
+
+# Sample queue for drifting loss
+sample_queue:
+  queue_size: 128

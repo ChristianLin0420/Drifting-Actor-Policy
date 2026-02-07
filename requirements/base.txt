@@ -1,0 +1,59 @@
+# =============================================================================
+# Drifting-VLA Base Requirements
+# =============================================================================
+# Core dependencies for training and inference.
+# GPU dependencies (torch, flash-attn) should be installed via Docker.
+# =============================================================================
+
+# Configuration and CLI
+hydra-core>=1.3.2
+omegaconf>=2.3.0
+typer>=0.9.0
+rich>=13.7.0
+
+# Logging and Tracking
+wandb>=0.16.3
+tensorboard>=2.15.1
+
+# Transformers and Model Hubs
+transformers>=4.38.0
+accelerate>=0.27.0
+safetensors>=0.4.2
+huggingface-hub>=0.21.0
+timm>=0.9.12
+
+# Scientific Computing
+numpy>=1.26.0
+scipy>=1.12.0
+scikit-learn>=1.4.0
+
+# Data Handling
+h5py>=3.10.0
+zarr>=2.17.0
+lmdb>=1.4.1
+
+# Image Processing
+opencv-python-headless>=4.9.0
+Pillow>=10.2.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9
+
+# Utilities
+einops>=0.7.0
+tqdm>=4.66.0
+
+# Visualization
+matplotlib>=3.8.0
+seaborn>=0.13.0
+plotly>=5.19.0
+
+# 3D Visualization
+trimesh>=4.1.0
+pyglet>=2.0.0
+
+# Video Processing
+moviepy>=1.0.0
+imageio>=2.34.0
+
+# Image Processing
+Pillow>=10.0.0

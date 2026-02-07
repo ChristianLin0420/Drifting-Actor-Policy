@@ -1,0 +1,146 @@
+# =============================================================================
+# Drifting-VLA Base Docker Image
+# =============================================================================
+# Base image with CUDA 12.1, PyTorch 2.2, and common dependencies for 
+# Drifting-VLA training and inference.
+#
+# Usage:
+#   docker build -f Dockerfile.base -t drifting-vla-base:latest .
+# =============================================================================
+
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# =============================================================================
+# System Dependencies
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build tools
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    wget \
+    curl \
+    unzip \
+    # Python
+    python3.10 \
+    python3.10-dev \
+    python3.10-venv \
+    python3-pip \
+    # Graphics and rendering
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libglew-dev \
+    libosmesa6-dev \
+    # X11 for headless rendering
+    xvfb \
+    x11-utils \
+    # Compression and utilities
+    libhdf5-dev \
+    liblz4-dev \
+    libzstd-dev \
+    # Networking
+    openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Python 3.10 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
+# Upgrade pip
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# =============================================================================
+# PyTorch with CUDA 12.1
+# =============================================================================
+RUN pip install --no-cache-dir \
+    torch==2.2.0 \
+    torchvision==0.17.0 \
+    torchaudio==2.2.0 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# =============================================================================
+# Flash Attention 2 (optimized for H100)
+# =============================================================================
+RUN pip install --no-cache-dir flash-attn==2.5.0 --no-build-isolation
+
+# =============================================================================
+# Core ML Dependencies
+# =============================================================================
+RUN pip install --no-cache-dir \
+    # Transformers and model hubs
+    transformers==4.38.0 \
+    accelerate==0.27.0 \
+    safetensors==0.4.2 \
+    huggingface-hub==0.21.0 \
+    # Configuration and logging
+    hydra-core==1.3.2 \
+    omegaconf==2.3.0 \
+    wandb==0.16.3 \
+    tensorboard==2.15.1 \
+    # Scientific computing
+    numpy==1.26.4 \
+    scipy==1.12.0 \
+    scikit-learn==1.4.0 \
+    # Data handling
+    h5py==3.10.0 \
+    zarr==2.17.0 \
+    lmdb==1.4.1 \
+    # Image processing
+    opencv-python-headless==4.9.0.80 \
+    Pillow==10.2.0 \
+    imageio==2.34.0 \
+    imageio-ffmpeg==0.4.9 \
+    # Utilities
+    einops==0.7.0 \
+    timm==0.9.12 \
+    tqdm==4.66.2 \
+    rich==13.7.0 \
+    typer==0.9.0 \
+    # Visualization
+    matplotlib==3.8.3 \
+    seaborn==0.13.2 \
+    plotly==5.19.0 \
+    # Distributed training
+    deepspeed==0.14.0
+
+# =============================================================================
+# Development Tools (included in base for consistency)
+# =============================================================================
+RUN pip install --no-cache-dir \
+    pytest==8.0.1 \
+    pytest-cov==4.1.0 \
+    black==24.2.0 \
+    ruff==0.2.2 \
+    isort==5.13.2 \
+    mypy==1.8.0 \
+    ipython==8.21.0 \
+    jupyterlab==4.1.2
+
+# =============================================================================
+# Environment Variables
+# =============================================================================
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="${CUDA_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+
+# WandB settings for offline mode (useful for SLURM)
+ENV WANDB_MODE=online
+ENV WANDB_SILENT=true
+
+# Set working directory
+WORKDIR /workspace
+
+# Default command
+CMD ["/bin/bash"]
+
+

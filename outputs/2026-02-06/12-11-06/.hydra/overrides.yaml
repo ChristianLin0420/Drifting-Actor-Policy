@@ -1,0 +1,5 @@
+- training.max_steps=20
+- training.use_fsdp=false
+- model.transformer.use_flash_attn=false
+- training.log_every_n_steps=5
+- training.eval_every_n_steps=10000
