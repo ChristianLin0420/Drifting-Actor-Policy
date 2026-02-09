@@ -8,7 +8,7 @@ weight_decay: 0.05
 warmup_steps: 1000
 max_steps: 100000
 grad_clip: 2.0
-grad_accumulation_steps: 1
+grad_accumulation_steps: 4  # Effective batch = 32 * 4 = 128
 
 # Batch
 batch_size: 32
@@ -23,8 +23,8 @@ drifting:
   temperatures: [0.02, 0.05, 0.2]
   normalize_features: true
   normalize_drift: true
-  n_pos_samples: 32
-  n_neg_samples: 32
+  n_pos_samples: 64
+  n_neg_samples: 64
 
 # Mixed Precision
 use_amp: true

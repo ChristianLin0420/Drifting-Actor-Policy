@@ -269,12 +269,17 @@ class DiTAttention(nn.Module):
         
         # Attention computation
         if self.use_flash_attn and attention_mask is None:
-            # Use Flash Attention (requires specific tensor layout)
+            # Use Flash Attention (requires bf16/fp16 tensors)
             from flash_attn import flash_attn_func
             q = q.transpose(1, 2)  # [B, L, H, D]
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
+            # Flash Attention requires fp16 or bf16 — cast if needed
+            orig_dtype = q.dtype
+            if q.dtype not in (torch.float16, torch.bfloat16):
+                q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
             out = flash_attn_func(q, k, v, dropout_p=self.dropout.p if self.training else 0.0)
+            out = out.to(orig_dtype)  # Cast back
             out = out.reshape(B, L, self.hidden_dim)
         else:
             # Standard attention

@@ -13,7 +13,7 @@ from drifting_vla.data.base_dataset import BaseVLADataset, VLADataPoint
 from drifting_vla.data.rlbench_dataset import RLBenchDataset
 from drifting_vla.data.rlbench_collector import RLBenchCollector, CollectorConfig
 from drifting_vla.data.transforms import VLATransforms
-from drifting_vla.data.sample_queue import SampleQueue
+from drifting_vla.data.sample_queue import SampleQueue, NegativeSampleQueue
 
 __all__ = [
     "BaseVLADataset",
@@ -23,5 +23,6 @@ __all__ = [
     "CollectorConfig",
     "VLATransforms",
     "SampleQueue",
+    "NegativeSampleQueue",
 ]
 

@@ -481,6 +481,60 @@ class RLBenchDataset(BaseVLADataset):
         """Return list of task names."""
         return self.tasks
     
+    def compute_action_statistics(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Compute per-dimension action mean and std efficiently.
+        
+        Only reads low_dim_obs.pkl (no image loading), subsamples episodes
+        for speed. Sets self.action_mean and self.action_std.
+        
+        Returns:
+            Tuple of (mean, std) arrays, each shape [8].
+        """
+        all_actions = []
+        
+        # Collect actions from a subset of episodes (fast, no image loading)
+        seen_episodes = set()
+        for sample in self.samples:
+            ep_dir = sample.get('episode_dir', '')
+            if ep_dir in seen_episodes:
+                continue
+            seen_episodes.add(ep_dir)
+            
+            if sample.get('format') == 'peract':
+                try:
+                    with open(Path(ep_dir) / 'low_dim_obs.pkl', 'rb') as f:
+                        low_dim_obs = pickle.load(f)
+                    for obs in low_dim_obs:
+                        action = np.concatenate([
+                            obs.gripper_pose,
+                            [obs.gripper_open]
+                        ]).astype(np.float32)
+                        all_actions.append(action)
+                except Exception:
+                    continue
+            
+            # Limit to 500 episodes for speed
+            if len(seen_episodes) >= 500:
+                break
+        
+        if not all_actions:
+            logger.warning("No actions found for normalization, using identity")
+            self.action_mean = np.zeros(8, dtype=np.float32)
+            self.action_std = np.ones(8, dtype=np.float32)
+            return self.action_mean, self.action_std
+        
+        all_actions = np.array(all_actions)
+        self.action_mean = np.mean(all_actions, axis=0).astype(np.float32)
+        self.action_std = np.std(all_actions, axis=0).astype(np.float32)
+        
+        # Ensure no zero-std dimensions
+        self.action_std = np.maximum(self.action_std, 1e-4)
+        
+        logger.info(f"Action stats from {len(all_actions)} timesteps across {len(seen_episodes)} episodes")
+        
+        return self.action_mean, self.action_std
+    
     def get_task_language_map(self) -> dict[str, list[str]]:
         """Get mapping from task names to language descriptions."""
         task_langs = {}

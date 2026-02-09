@@ -45,6 +45,7 @@ class RLBenchEnvironment(BaseEnvironment):
         self.env = None
         self.task = None
         self.task_descriptions = {}
+        self._last_front_rgb = None  # Store COPIED front camera frame for render()
         
         # Initialize RLBench
         self._init_rlbench()
@@ -201,6 +202,11 @@ class RLBenchEnvironment(BaseEnvironment):
         
         # Reset task — returns (descriptions_list, observation)
         descriptions, obs = self.task.reset()
+        # COPY the image — RLBench reuses the same buffer!
+        if hasattr(obs, 'front_rgb') and obs.front_rgb is not None:
+            self._last_front_rgb = obs.front_rgb.copy()
+        else:
+            self._last_front_rgb = None
         
         # Cache language description from reset output
         if descriptions:
@@ -251,19 +257,27 @@ class RLBenchEnvironment(BaseEnvironment):
         try:
             obs, reward, done = self.task.step(action)
             success = reward > 0
+            # COPY the image — RLBench reuses the same buffer!
+            if hasattr(obs, 'front_rgb') and obs.front_rgb is not None:
+                self._last_front_rgb = obs.front_rgb.copy()
+            if self.episode_length <= 3:
+                logger.info(f"  Step {self.episode_length}: action executed OK, reward={reward}")
         except Exception as e:
-            # Path planning failures are common — don't end the episode,
-            # just skip this step and let the policy try again
+            # Path planning failures — robot stays in place
             if "path could not be found" in str(e).lower():
-                logger.debug(f"Path planning failed (step {self.episode_length}), continuing")
+                logger.info(f"  Step {self.episode_length}: PATH PLANNING FAILED — robot didn't move")
                 obs = self._get_current_obs()
+                if obs is not None and hasattr(obs, 'front_rgb') and obs.front_rgb is not None:
+                    self._last_front_rgb = obs.front_rgb.copy()
                 success = False
                 done = False
             else:
-                logger.warning(f"Step failed: {e}")
+                logger.info(f"  Step {self.episode_length}: FAILED — {e}")
                 success = False
                 done = True
                 obs = self._get_current_obs()
+                if obs is not None and hasattr(obs, 'front_rgb') and obs.front_rgb is not None:
+                    self._last_front_rgb = obs.front_rgb.copy()
         
         # Check max episode length
         if self.episode_length >= self.config.max_episode_length:
@@ -389,16 +403,17 @@ class RLBenchEnvironment(BaseEnvironment):
         )
     
     def render(self, mode: str = 'rgb_array') -> Optional[np.ndarray]:
-        """Render current state."""
-        if self.env is None:
-            return None
+        """
+        Render current state as RGB image.
         
-        try:
-            obs = self._get_current_obs()
-            if obs is not None:
-                return obs.front_rgb
-        except:
-            pass
+        Returns a COPY of the front camera frame (RLBench reuses
+        internal buffers, so we must copy on capture).
+        
+        Returns:
+            RGB image [H, W, 3] as uint8, or None if unavailable.
+        """
+        if self._last_front_rgb is not None:
+            return self._last_front_rgb  # Already a copy
         
         return None
     

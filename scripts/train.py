@@ -138,6 +138,13 @@ def build_dataloaders(cfg: DictConfig, rank: int, world_size: int):
         transform=transforms,
     )
     
+    # Compute action normalization statistics from training data
+    # This normalizes [x,y,z,qx,qy,qz,qw,grip] per-dimension to zero-mean unit-var
+    logger.info("Computing action normalization statistics...")
+    action_mean, action_std = train_dataset.compute_action_statistics()
+    logger.info(f"Action mean: {action_mean}")
+    logger.info(f"Action std:  {action_std}")
+    
     val_dataset = RLBenchDataset(
         data_dir=cfg.data.data_dir,
         split='val',
@@ -147,6 +154,9 @@ def build_dataloaders(cfg: DictConfig, rank: int, world_size: int):
         cameras=cfg.data.cameras,
         transform=VLATransforms(training=False),
     )
+    # Share normalization stats with val dataset
+    val_dataset.action_mean = action_mean
+    val_dataset.action_std = action_std
     
     # Samplers
     if world_size > 1:

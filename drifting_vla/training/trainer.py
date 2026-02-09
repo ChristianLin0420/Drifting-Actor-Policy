@@ -242,6 +242,7 @@ class DriftingVLATrainer:
         self.config = config or TrainerConfig()
         self.wandb_logger = wandb_logger
         self.sample_queue = sample_queue
+        self.neg_queue = None  # Created after device is known
         
         # Setup distributed training
         self.is_distributed = dist.is_initialized()
@@ -296,6 +297,23 @@ class DriftingVLATrainer:
         else:
             self.amp_dtype = torch.float32
             self.scaler = None
+        
+        # Negative sample queue for drifting loss
+        # Stores recent model predictions so negatives come from PREVIOUS steps,
+        # not the current batch. This prevents V_attract ≈ V_repel → V ≈ 0.
+        from drifting_vla.data.sample_queue import NegativeSampleQueue
+        action_dim = (
+            getattr(self._get_unwrapped_model().config, 'action_horizon', 16) *
+            (getattr(self._get_unwrapped_model().config.action_decoder, 'position_dim', 3) +
+             getattr(self._get_unwrapped_model().config.action_decoder, 'rotation_dim', 4) +
+             getattr(self._get_unwrapped_model().config.action_decoder, 'gripper_dim', 1))
+        )
+        self.neg_queue = NegativeSampleQueue(
+            queue_size=2048,  # Store ~64 batches of predictions
+            action_dim=action_dim,
+            device=self.device,
+        )
+        logger.info(f"Initialized negative sample queue: size=2048, action_dim={action_dim}")
         
         # Training state
         self.global_step = 0
@@ -388,6 +406,8 @@ class DriftingVLATrainer:
         # Training metrics
         metrics = {
             'loss': 0.0,
+            'mse_loss': 0.0,
+            'drift_loss': 0.0,
             'drift_norm': 0.0,
             'raw_drift_norm': 0.0,
             'lambda_V': 0.0,
@@ -490,19 +510,40 @@ class DriftingVLATrainer:
             actions_flat = actions_pred.view(B, -1)  # [B, T * D_a]
             actions_gt_flat = actions_gt.view(B, -1)
             
-            # Get positive samples (from queue or batch)
+            # Get positive samples (from queue or batch GT)
             if self.sample_queue is not None:
                 pos_samples = self.sample_queue.sample(self.config.n_pos_samples)
                 pos_samples = pos_samples.to(self.device).view(self.config.n_pos_samples, -1)
             else:
                 pos_samples = actions_gt_flat
             
-            # Negative samples (current batch predictions)
-            neg_samples = actions_flat.detach()
+            # Negative samples from PREVIOUS steps (not current batch!)
+            # Using x.detach() would make V_attract ≈ V_repel → V ≈ 0
+            # because negatives would be identical to queries.
+            # Instead, sample from a queue of recent model predictions.
+            if len(self.neg_queue) >= self.config.n_neg_samples:
+                neg_samples = self.neg_queue.sample(self.config.n_neg_samples)
+                neg_samples = neg_samples.to(self.device)
+            else:
+                # Fallback for first few steps when queue is empty:
+                # use batch GT as negatives (they're at least different from x)
+                neg_samples = actions_gt_flat.detach()
             
-            # Compute drifting loss
+            # Push current predictions to negative queue for future steps
+            self.neg_queue.push(actions_flat.detach())
+            
+            # ============================================================
+            # HYBRID LOSS: MSE (reliable at any batch) + Drifting (multi-modal)
+            # ============================================================
+            # 1. Direct MSE supervision — strong gradient signal
+            mse_loss = ((actions_pred - actions_gt) ** 2).mean()
+            
+            # 2. Drifting loss — adds multi-modal structure
             loss_output = self.loss_fn(actions_flat, pos_samples, neg_samples)
-            loss = loss_output.loss
+            drift_loss = loss_output.loss
+            
+            # 3. Combined: MSE dominates, drifting adds diversity
+            loss = mse_loss + 0.1 * drift_loss
         
         # Gradient accumulation
         loss = loss / self.config.grad_accumulation_steps
@@ -548,6 +589,8 @@ class DriftingVLATrainer:
         
         return {
             'loss': loss.item() * self.config.grad_accumulation_steps,
+            'mse_loss': mse_loss.item(),
+            'drift_loss': drift_loss.item(),
             'drift_norm': loss_output.drift_norm.item(),
             'raw_drift_norm': loss_output.raw_drift_norm.item() if loss_output.raw_drift_norm is not None else 0.0,
             'lambda_V': loss_output.lambda_V.item() if loss_output.lambda_V is not None else 0.0,
@@ -657,12 +700,16 @@ class DriftingVLATrainer:
         
         raw_dn = metrics.get('raw_drift_norm', 0) / steps
         lv = metrics.get('lambda_V', 0) / steps
+        mse_l = metrics.get('mse_loss', 0) / steps
+        drift_l = metrics.get('drift_loss', 0) / steps
         
         log_dict = {
             'train/loss': metrics['loss'] / steps,
+            'train/mse_loss': mse_l,             # MSE component (should ↓ toward 0)
+            'train/drift_loss': drift_l,          # Drifting component
             'train/drift_norm': metrics['drift_norm'] / steps,
-            'train/raw_drift_norm': raw_dn,   # TRUE convergence metric (should ↓)
-            'train/lambda_V': lv,              # Normalization factor (should ↓)
+            'train/raw_drift_norm': raw_dn,
+            'train/lambda_V': lv,
             'train/grad_norm': metrics.get('grad_norm', 0) / steps,
             'train/lr': self.optimizer.param_groups[0]['lr'],
             'train/step': self.global_step,
@@ -674,8 +721,8 @@ class DriftingVLATrainer:
             self.wandb_logger.log(log_dict, step=self.global_step)
         
         logger.info(
-            f"Step {self.global_step}: loss={log_dict['train/loss']:.4f}, "
-            f"λ_V={lv:.4f}, raw_drift={raw_dn:.2f}, "
+            f"Step {self.global_step}: mse={mse_l:.4f}, drift={drift_l:.4f}, "
+            f"loss={log_dict['train/loss']:.4f}, "
             f"lr={log_dict['train/lr']:.2e}"
         )
     
@@ -1167,7 +1214,7 @@ class DriftingVLATrainer:
             # Log video
             if frames:
                 self.wandb_logger.log_video(
-                    'eval/trajectory_video', frames, fps=4,
+                    'eval/trajectory_video', frames, fps=5,
                     caption=f'Step {self.global_step}: {language[:100]}',
                     step=self.global_step)
                 logger.info(f"Logged evaluation video at step {self.global_step}")
@@ -1405,29 +1452,49 @@ class DriftingVLATrainer:
             logger.info(f"Running simulation evaluation on tasks: {tasks}")
             EnvClass = RLBenchEnvironment
         
+        # Get cameras from training dataset
+        try:
+            cameras = list(self.train_loader.dataset.cameras)
+        except:
+            cameras = ['front']
+        
         # Create environment config
         env_config = EnvConfig(
             task=tasks[0],
             image_size=224,
-            cameras=['front'],
+            cameras=cameras,
             max_episode_length=sim_cfg.max_steps,
             headless=True,
         )
+        
+        # Create action denormalizer if dataset has normalization stats
+        action_normalizer = None
+        try:
+            ds = self.train_loader.dataset
+            if ds.action_mean is not None and ds.action_std is not None:
+                from drifting_vla.data.transforms import ActionNormalization
+                action_normalizer = ActionNormalization(
+                    mean=ds.action_mean, std=ds.action_std
+                )
+                logger.info("Using action denormalization for simulation eval")
+        except Exception:
+            pass
         
         # Create policy from current model (using EMA if available)
         policy_config = PolicyConfig(
             cfg_scale=2.0,
             action_horizon=self.config.action_horizon if hasattr(self.config, 'action_horizon') else 16,
-            use_ema=False,  # We'll use EMA context manually
+            use_ema=False,
             device=str(self.device),
             temporal_ensemble=True,
         )
         
-        # Initialize policy with current model
+        # Initialize policy with current model and action denormalizer
         with self.ema.average_parameters():
             policy = DriftingVLAPolicy(
                 model=self._get_unwrapped_model(),
                 config=policy_config,
+                action_normalizer=action_normalizer,
             )
         
         rollout_config = RolloutConfig(

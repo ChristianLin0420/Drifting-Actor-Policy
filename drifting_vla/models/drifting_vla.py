@@ -223,9 +223,17 @@ class DriftingVLA(nn.Module):
         elif isinstance(cfg_scale, (int, float)):
             cfg_scale = torch.full((B,), cfg_scale, device=device)
         
-        # Encode visual features
-        visual_features = self.vision_encoder(images, return_all_tokens=True)  # [B, Nv, D_v]
-        visual_features = self.vision_proj(visual_features)  # [B, Nv, D_f]
+        # Encode visual features (supports multi-view [B, V, C, H, W])
+        if images.dim() == 5:
+            # Multi-view: process each view through shared DINOv2, concat tokens
+            B_img, V, C, H, W = images.shape
+            images_flat = images.view(B_img * V, C, H, W)
+            feats = self.vision_encoder(images_flat, return_all_tokens=True)  # [B*V, N, D_v]
+            N_tok, D_v = feats.shape[1], feats.shape[2]
+            visual_features = feats.view(B_img, V * N_tok, D_v)  # [B, V*N, D_v]
+        else:
+            visual_features = self.vision_encoder(images, return_all_tokens=True)  # [B, N, D_v]
+        visual_features = self.vision_proj(visual_features)  # [B, ?, D_f]
         
         # Encode language features
         language_features = self.language_encoder(

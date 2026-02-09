@@ -29,7 +29,7 @@ class EnvConfig:
     task: Union[str, list[str]] = 'reach_target'
     image_size: int = 224
     cameras: list[str] = None
-    action_mode: str = 'delta'
+    action_mode: str = 'absolute'  # Dataset stores absolute EE poses
     max_episode_length: int = 200
     headless: bool = True
     

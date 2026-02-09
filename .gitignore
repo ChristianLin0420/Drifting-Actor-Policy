@@ -214,3 +214,6 @@ checkpoints/
 
 # WandB
 wandb/
+
+# Outputs
+outputs/

@@ -285,3 +285,89 @@ class GlobalSampleQueue(SampleQueue):
         return super().sample(n=n, task_ids=[0], uniform_tasks=True)
 
 
+class NegativeSampleQueue:
+    """
+    Queue of recent model predictions for negative sampling in the drifting loss.
+    
+    WHY THIS IS NEEDED:
+    Using x.detach() as negatives means y_neg ≈ x, causing V_attract ≈ V_repel,
+    which makes the drifting field V ≈ 0. By storing predictions from PREVIOUS
+    steps, the negatives are different from the current x, giving a non-zero
+    drifting field that provides useful gradient signal.
+    
+    The paper uses a similar approach: q is the current generator distribution,
+    sampled from a pool of recent outputs across many GPUs (effective batch 8192).
+    This queue simulates that pool on a single GPU.
+    
+    Args:
+        queue_size: Maximum stored predictions (larger = more diverse negatives).
+        action_dim: Dimension of flattened action vectors.
+        device: Storage device.
+    
+    Example:
+        >>> neg_queue = NegativeSampleQueue(queue_size=1024, action_dim=128)
+        >>> 
+        >>> # Each training step:
+        >>> neg_samples = neg_queue.sample(64)           # Sample old predictions
+        >>> neg_queue.push(actions_pred.detach())         # Store new predictions
+    """
+    
+    def __init__(
+        self,
+        queue_size: int = 1024,
+        action_dim: int = 128,
+        device: torch.device = torch.device('cpu'),
+    ):
+        self.queue_size = queue_size
+        self.action_dim = action_dim
+        self.device = device
+        
+        # Ring buffer
+        self.buffer = torch.zeros(queue_size, action_dim, device=device)
+        self.write_idx = 0
+        self.count = 0
+    
+    def push(self, actions: torch.Tensor) -> None:
+        """
+        Push model predictions into the buffer.
+        
+        Args:
+            actions: Predicted actions [N, D] (flattened).
+        """
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(0)
+        
+        actions = actions.detach().to(self.device)
+        N = actions.shape[0]
+        
+        for i in range(N):
+            self.buffer[self.write_idx % self.queue_size] = actions[i]
+            self.write_idx += 1
+        
+        self.count = min(self.count + N, self.queue_size)
+    
+    def sample(self, n: int) -> torch.Tensor:
+        """
+        Sample negative predictions from the buffer.
+        
+        If the buffer has fewer than n samples, returns what's available
+        padded with random noise (which also serves as valid negatives).
+        
+        Args:
+            n: Number of samples.
+        
+        Returns:
+            Negative samples [n, D].
+        """
+        if self.count == 0:
+            # Buffer empty — return random noise as negatives
+            return torch.randn(n, self.action_dim, device=self.device)
+        
+        # Sample random indices from filled portion
+        indices = torch.randint(0, self.count, (n,), device=self.device)
+        return self.buffer[indices]
+    
+    def __len__(self) -> int:
+        return self.count
+
+
