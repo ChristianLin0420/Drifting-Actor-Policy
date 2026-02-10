@@ -26,6 +26,61 @@ from drifting_vla.data.base_dataset import BaseVLADataset
 logger = logging.getLogger(__name__)
 
 
+class _RLBenchStubUnpickler(pickle.Unpickler):
+    """Custom unpickler that handles missing rlbench/pyrep modules.
+    
+    The PerAct dataset pickle files contain serialized 
+    rlbench.backend.observation.Observation objects. This unpickler
+    creates lightweight stub classes so the data can be loaded
+    without requiring the full RLBench/PyRep installation.
+    
+    Stub instances store all pickled attributes in their __dict__,
+    so attribute access (e.g. obs.gripper_pose) works normally.
+    """
+    
+    # Demo is a list subclass in rlbench; stub must preserve that
+    # so len() / iteration / indexing work after unpickling.
+    _LIST_SUBCLASSES = {
+        ('rlbench.demo', 'Demo'),
+    }
+    _stub_cache = {}
+    
+    def find_class(self, module, name):
+        try:
+            return super().find_class(module, name)
+        except (ModuleNotFoundError, AttributeError):
+            if module.startswith(('rlbench', 'pyrep')):
+                key = (module, name)
+                if key not in self._stub_cache:
+                    base = list if key in self._LIST_SUBCLASSES else object
+                    self._stub_cache[key] = type(name, (base,), {
+                        '__module__': module,
+                    })
+                return self._stub_cache[key]
+            raise
+
+
+def _load_pickle(path):
+    """Load a pickle file, falling back to stub unpickler if rlbench is missing.
+
+    RLBench Demo objects store observations in *_observations* rather than
+    as direct list items when unpickled with stub classes.  This helper
+    transparently extracts the observation list so callers can iterate
+    and index into it normally.
+    """
+    with open(path, 'rb') as f:
+        try:
+            result = pickle.load(f)
+        except ModuleNotFoundError:
+            f.seek(0)
+            result = _RLBenchStubUnpickler(f).load()
+
+    # Demo stores observations in _observations when using stubs
+    if hasattr(result, '_observations') and len(result) == 0:
+        return result._observations
+    return result
+
+
 class RLBenchDataset(BaseVLADataset):
     """
     Dataset for RLBench demonstrations.
@@ -191,16 +246,14 @@ class RLBenchDataset(BaseVLADataset):
                     continue
                 
                 try:
-                    with open(low_dim_path, 'rb') as f:
-                        low_dim_obs = pickle.load(f)
+                    low_dim_obs = _load_pickle(low_dim_path)
                     
                     ep_length = len(low_dim_obs)
                     
                     # Get language description
                     desc_path = ep_dir / 'variation_descriptions.pkl'
                     if desc_path.exists():
-                        with open(desc_path, 'rb') as f:
-                            descriptions = pickle.load(f)
+                        descriptions = _load_pickle(desc_path)
                         language = descriptions[0] if descriptions else task_name.replace('_', ' ')
                     else:
                         language = task_name.replace('_', ' ')
@@ -317,8 +370,7 @@ class RLBenchDataset(BaseVLADataset):
         T = min(t + self.action_horizon, ep_length)
         
         # Load low_dim_obs for actions and proprio
-        with open(ep_dir / 'low_dim_obs.pkl', 'rb') as f:
-            low_dim_obs = pickle.load(f)
+        low_dim_obs = _load_pickle(ep_dir / 'low_dim_obs.pkl')
         
         # Extract actions (gripper pose delta or joint velocities)
         actions = []
@@ -503,8 +555,7 @@ class RLBenchDataset(BaseVLADataset):
             
             if sample.get('format') == 'peract':
                 try:
-                    with open(Path(ep_dir) / 'low_dim_obs.pkl', 'rb') as f:
-                        low_dim_obs = pickle.load(f)
+                    low_dim_obs = _load_pickle(Path(ep_dir) / 'low_dim_obs.pkl')
                     for obs in low_dim_obs:
                         action = np.concatenate([
                             obs.gripper_pose,
