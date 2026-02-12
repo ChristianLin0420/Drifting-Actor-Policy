@@ -91,9 +91,13 @@ DATASETS = {
 # ──────────────────────────────────────────────────────────────────────
 
 def download_lerobot_dataset(name, info, dest, n_samples=None):
-    """Download a LeRobot-format dataset and save as Arrow."""
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset as LDS
+    """
+    Download a LeRobot-format dataset — only the samples needed, not the full dataset.
 
+    Strategy:
+      1. Try HuggingFace `datasets` library with split slicing (downloads only needed parquet chunks)
+      2. Fallback to lerobot API if datasets library fails (downloads full cache)
+    """
     hf_repo = info['hf_repo']
     save_path = dest / name / 'arrow_data'
 
@@ -101,49 +105,83 @@ def download_lerobot_dataset(name, info, dest, n_samples=None):
         logger.info(f"  ✓ {name} already downloaded at {save_path}")
         return True
 
-    logger.info(f"  Loading {hf_repo} ...")
+    logger.info(f"  Downloading {hf_repo} ({n_samples or 'all'} samples) ...")
+
+    # --- Strategy 1: HuggingFace datasets library (partial download) ---
     try:
+        from datasets import load_dataset
+
+        if n_samples:
+            # Only download the first n_samples from the 'train' split
+            # This downloads only the parquet chunks needed, NOT the full dataset
+            hf_ds = load_dataset(hf_repo, split=f'train[:{n_samples}]')
+        else:
+            hf_ds = load_dataset(hf_repo, split='train')
+
+        save_path.mkdir(parents=True, exist_ok=True)
+        hf_ds.save_to_disk(str(save_path))
+
+        logger.info(f"  ✓ {name}: {len(hf_ds)} samples saved (HF datasets, partial download)")
+        if len(hf_ds) > 0:
+            cols = hf_ds.column_names[:8]
+            logger.info(f"    Columns: {cols}")
+        return True
+
+    except Exception as e1:
+        logger.warning(f"  HF datasets failed: {e1}")
+
+    # --- Strategy 2: lerobot API (downloads full cache, extracts n_samples) ---
+    try:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset as LDS
+        from datasets import Dataset as HFDataset
+
+        logger.info(f"  Falling back to lerobot API (may download full dataset to cache)...")
         ds = LDS(hf_repo)
         total = len(ds)
 
-        # Select subset
         if n_samples and n_samples < total:
             indices = list(range(n_samples))
         else:
             indices = list(range(total))
             n_samples = total
 
-        # Convert to HuggingFace Dataset for saving
-        from datasets import Dataset as HFDataset
         records = []
         for i in indices:
-            row = ds[i]
-            record = {}
-            for k, v in row.items():
-                if hasattr(v, 'numpy'):
-                    record[k] = v.numpy().tolist()
-                else:
-                    record[k] = v
-            records.append(record)
+            try:
+                row = ds[i]
+                record = {}
+                for k, v in row.items():
+                    if hasattr(v, 'numpy'):
+                        record[k] = v.numpy().tolist()
+                    else:
+                        record[k] = v
+                records.append(record)
+            except Exception:
+                continue  # Skip failed samples (video decode errors)
+
+        if not records:
+            logger.error(f"  ✗ No valid samples from {hf_repo}")
+            return False
 
         hf_ds = HFDataset.from_list(records)
         save_path.mkdir(parents=True, exist_ok=True)
         hf_ds.save_to_disk(str(save_path))
 
-        # Print format info
-        s = ds[0]
-        act_dim = s['action'].shape[0] if 'action' in s else '?'
-        lang = str(s.get('task', ''))[:60]
-        img_keys = [k for k in s.keys() if 'image' in k.lower()]
+        logger.info(f"  ✓ {name}: {len(records)} samples saved (lerobot API)")
 
-        logger.info(f"  ✓ {name}: {n_samples} samples saved")
-        logger.info(f"    Action dim: {act_dim}, Images: {len(img_keys)} views")
-        logger.info(f"    Language: \"{lang}\"")
-        logger.info(f"    Image keys: {img_keys[:3]}")
+        # Clean lerobot cache to save disk
+        import shutil
+        cache_dir = Path.home() / '.cache' / 'huggingface' / 'lerobot'
+        if cache_dir.exists():
+            cache_size = sum(f.stat().st_size for f in cache_dir.rglob('*') if f.is_file()) / 1e9
+            if cache_size > 1.0:  # Only clean if > 1 GB
+                logger.info(f"  Cleaning lerobot cache ({cache_size:.1f} GB)...")
+                shutil.rmtree(str(cache_dir), ignore_errors=True)
+
         return True
 
-    except Exception as e:
-        logger.error(f"  ✗ Failed to download {hf_repo}: {e}")
+    except Exception as e2:
+        logger.error(f"  ✗ Failed to download {hf_repo}: {e2}")
         import traceback
         traceback.print_exc()
         return False

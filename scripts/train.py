@@ -221,7 +221,7 @@ class DriftingVLATrainer:
                         repo_id=hf_repo,
                         image_size=cfg.image_size,
                         action_horizon=cfg.action_horizon,
-                        max_samples=50 if getattr(cfg, '_test_mode', False) else None,
+                        max_samples=getattr(cfg, 'max_samples_per_dataset', None) or (50 if getattr(cfg, '_test_mode', False) else None),
                     )
                 else:
                     logger.warning(f"Unknown dataset: {ds_name}, skipping")
@@ -624,6 +624,8 @@ def parse_args():
     parser.add_argument('--wandb-project', type=str, default='drifting-vla')
     parser.add_argument('--log-every', type=int, default=50)
     parser.add_argument('--save-every', type=int, default=2000)
+    parser.add_argument('--max-samples', type=int, default=None,
+                        help='Max samples per dataset (e.g., 10000 for quick experiments)')
     
     return parser.parse_args()
 
@@ -658,6 +660,7 @@ def main():
     config.save_every = args.save_every
     config.use_flash_attn = args.use_flash_attn
     config.skip_vlm = args.skip_vlm
+    config.max_samples_per_dataset = args.max_samples
     
     # Model size configs
     size_cfgs = {
