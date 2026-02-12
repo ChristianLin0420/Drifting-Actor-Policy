@@ -119,7 +119,9 @@ class UnifiedDataset(Dataset):
                 # Set std of inactive dims to 1 (avoid division by zero)
                 mask_info = get_action_mask(embodiment_id)
                 unified_std[~mask_info.mask] = 1.0
-                unified_std = np.maximum(unified_std, 1e-4)
+                # Clamp min std to 0.01 — prevents normalization blowup
+                # (e.g., quaternion dims with std=0.009 would amplify by 100×)
+                unified_std = np.maximum(unified_std, 0.01)
                 
                 self.action_stats[name] = {
                     'mean': unified_mean,
@@ -208,11 +210,30 @@ class UnifiedDataset(Dataset):
             'dataset_name': dataset_name,
             'sample_id': idx,
         }
-        
+
+        # Pass through proprioception — pad to 128-dim unified space
+        if 'proprio' in raw_sample:
+            p = raw_sample['proprio']
+            if isinstance(p, torch.Tensor):
+                p = p.numpy()
+            elif not isinstance(p, np.ndarray):
+                p = np.array(p, dtype=np.float32)
+            # Pad to 128-dim
+            proprio = np.zeros(UNIFIED_ACTION_DIM, dtype=np.float32)
+            n = min(len(p.flatten()), UNIFIED_ACTION_DIM)
+            proprio[:n] = p.flatten()[:n]
+            result['proprio'] = torch.from_numpy(proprio).float()
+        else:
+            result['proprio'] = torch.zeros(UNIFIED_ACTION_DIM, dtype=torch.float32)
+
+        # Pass through camera/time metadata
+        result['num_views'] = raw_sample.get('num_views', images_np.shape[0])
+        result['num_frames'] = raw_sample.get('num_frames', 1)
+
         if vlm_features is not None:
             result['vlm_features'] = vlm_features
             result['vlm_pooled'] = vlm_pooled
-        
+
         return result
     
     def get_action_stats(self, dataset_name: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -292,6 +313,14 @@ def collate_unified(batch: List[dict]) -> dict:
     result['language'] = [s['language'] for s in batch]
     result['dataset_name'] = [s['dataset_name'] for s in batch]
     result['sample_id'] = torch.tensor([s['sample_id'] for s in batch], dtype=torch.long)
+
+    # Proprioception (padded to 128-dim in dataset, just stack)
+    if 'proprio' in batch[0]:
+        result['proprio'] = torch.stack([s['proprio'] for s in batch])
+
+    # Camera/time metadata (take max from batch)
+    result['num_views'] = max(s.get('num_views', 1) for s in batch)
+    result['num_frames'] = max(s.get('num_frames', 1) for s in batch)
     
     # Pad VLM features if present in ANY sample
     has_vlm = any('vlm_features' in s and s.get('vlm_features') is not None for s in batch)

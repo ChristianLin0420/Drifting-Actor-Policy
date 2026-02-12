@@ -244,32 +244,3 @@ def main():
 if __name__ == '__main__':
     main()
 
-
-
-Download real data for Drifting-VLA pretraining pipeline.
-
-Downloads N real samples per dataset from HuggingFace for testing/debugging.
-
-Usage:
-    python scripts/download_datasets.py --test                  # 50 samples each
-    python scripts/download_datasets.py --dataset aloha --test  # specific dataset
-    python scripts/download_datasets.py --all                   # full datasets
-"""
-
-import argparse
-import os
-import sys
-from pathlib import Path
-import logging
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
-
-DATA_ROOT = Path('./data')
-TEST_SAMPLES = 50
-
-
-# ──────────────────────────────────────────────────────────────────────
-# All verified datasets
-# ──────────────────────────────────────────────────────────────────────
-

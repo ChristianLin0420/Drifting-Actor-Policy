@@ -128,42 +128,115 @@ class LeRobotDataset:
         return len(self._indices)
     
     def __getitem__(self, idx: int) -> dict:
-        """Load a sample in our standard format."""
+        """Load a sample with proprioception and multi-frame history."""
         if self.lerobot_ds is None:
             return self._empty_sample()
-        
+
         real_idx = self._indices[idx]
         try:
             row = self.lerobot_ds[real_idx]
         except (RuntimeError, Exception):
-            # Video decode errors (torchcodec) — skip this sample
             if idx + 1 < len(self._indices):
                 return self.__getitem__(idx + 1)
             return self._empty_sample()
-        
+
         # --- Actions ---
         action = row.get('action', torch.zeros(self.action_dim))
         actions = action.unsqueeze(0).repeat(self.action_horizon, 1).numpy()
-        
-        # --- Images (all RGB views, Pi0 style) ---
-        images = self._extract_images(row)
-        
+
+        # --- Multi-frame images (t-1, t, t+1) × all RGB views ---
+        images, num_views, num_frames = self._extract_multiframe_images(real_idx, row)
+
         # --- Language ---
         language = self._extract_language(row)
-        
+
+        # --- Proprioception (robot state) ---
+        proprio = self._extract_proprio(row)
+
         # --- Metadata ---
         episode_idx = row.get('episode_index', torch.tensor(0))
         if isinstance(episode_idx, torch.Tensor):
             episode_idx = episode_idx.item()
-        
+
         return {
             'images': torch.from_numpy(images).float(),
             'language': language,
             'actions': torch.from_numpy(actions.astype(np.float32)),
+            'proprio': torch.from_numpy(proprio).float(),
             'task_id': 0,
             'episode_id': int(episode_idx),
             'timestep': int(row.get('frame_index', torch.tensor(0)).item()) if isinstance(row.get('frame_index'), torch.Tensor) else 0,
+            'num_views': num_views,
+            'num_frames': num_frames,
         }
+
+    def _extract_multiframe_images(self, real_idx: int, current_row: dict) -> tuple:
+        """
+        Extract multi-frame (t-1, t, t+1) multi-view images.
+
+        Returns:
+            images: [T_hist * V, 3, H, W] all frames × all views stacked
+            num_views: int (V per frame)
+            num_frames: int (T_hist, typically 3)
+        """
+        current_ep = current_row.get('episode_index', torch.tensor(-1))
+        if isinstance(current_ep, torch.Tensor):
+            current_ep = current_ep.item()
+
+        # Collect frames: t-1, t, t+1
+        frame_offsets = [-1, 0, 1]
+        all_frame_images = []
+
+        for dt in frame_offsets:
+            target_idx = real_idx + dt
+
+            # Clamp to valid range and same episode
+            if 0 <= target_idx < len(self.lerobot_ds):
+                try:
+                    target_row = self.lerobot_ds[target_idx]
+                    target_ep = target_row.get('episode_index', torch.tensor(-2))
+                    if isinstance(target_ep, torch.Tensor):
+                        target_ep = target_ep.item()
+                    if target_ep != current_ep:
+                        target_row = current_row  # Stay at current if out of episode
+                except (RuntimeError, Exception):
+                    target_row = current_row
+            else:
+                target_row = current_row  # Clamp at boundaries
+
+            frame_imgs = self._extract_images(target_row)  # [V, 3, H, W]
+            all_frame_images.append(frame_imgs)
+
+        num_views = all_frame_images[0].shape[0]
+        num_frames = len(frame_offsets)
+
+        # Stack: [T_hist * V, 3, H, W]
+        images = np.concatenate(all_frame_images, axis=0)
+        return images, num_views, num_frames
+
+    def _extract_proprio(self, row: dict) -> np.ndarray:
+        """
+        Extract proprioception (robot state) from a LeRobot sample.
+
+        Maps to 128-dim unified space (same as actions).
+        """
+        # LeRobot stores proprioception as 'observation.state'
+        for key in ['observation.state', 'state', 'observation.proprio']:
+            if key in row:
+                val = row[key]
+                if isinstance(val, torch.Tensor):
+                    val = val.numpy()
+                elif not isinstance(val, np.ndarray):
+                    continue
+
+                # Pad to 128-dim (same unified space as actions)
+                proprio = np.zeros(128, dtype=np.float32)
+                n = min(len(val), 128)
+                proprio[:n] = val.flatten()[:n]
+                return proprio
+
+        # No proprioception available — return zeros
+        return np.zeros(128, dtype=np.float32)
     
     def _extract_images(self, row: dict) -> np.ndarray:
         """

@@ -355,42 +355,48 @@ class DriftingVLATrainer:
         cfg = self.config
         
         # Move to device
-        images = batch['images'].to(self.device)       # [B, V, 3, H, W]
+        images = batch['images'].to(self.device)       # [B, V_total, 3, H, W]
         actions_gt = batch['actions'].to(self.device)   # [B, T, 128]
         action_mask = batch['action_mask'].to(self.device)  # [B, 128]
         embodiment_id = batch['embodiment_id'].to(self.device)
-        
+
+        # Proprioception (robot state, 128-dim unified)
+        proprio = batch.get('proprio', None)
+        if proprio is not None:
+            proprio = proprio.to(self.device)
+
+        # Camera/time metadata for positional embeddings
+        num_views = batch.get('num_views', 1)
+        num_frames = batch.get('num_frames', 1)
+
         B, T, D = actions_gt.shape
-        
-        # VLM features: pre-computed (fast) or live forward through model (slower)
+
+        # VLM encoding: online by default (Pi0-style)
         vlm_features = batch.get('vlm_features', None)
         vlm_pooled = batch.get('vlm_pooled', None)
         vlm_attn_mask = batch.get('vlm_attn_mask', None)
-        use_live_vlm = False
-        
-        if vlm_features is not None:
+        use_live_vlm = vlm_features is None
+
+        if not use_live_vlm:
             vlm_features = vlm_features.to(self.device)
             vlm_pooled = vlm_pooled.to(self.device)
             if vlm_attn_mask is not None:
                 vlm_attn_mask = vlm_attn_mask.to(self.device)
         else:
-            # No pre-computed features: model will run VLM live in its forward()
             model = self._unwrapped_model()
             if not model.vlm_backbone._loaded:
                 model.vlm_backbone.load_vlm(self.device)
-            use_live_vlm = True
             vlm_attn_mask = None
-        
+
         # Sample noise
         noise = torch.randn(B, T, cfg.noise_dim, device=self.device)
-        
+
         # Sample CFG scale
         cfg_scale = self._sample_cfg_scale(B)
-        
-        # Forward pass
+
+        # Forward pass (with proprio + camera/time metadata)
         with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=cfg.use_amp):
             if use_live_vlm:
-                # Pass images + language directly; model runs VLM internally
                 language = batch.get('language', [''] * B)
                 actions_pred = self.model(
                     images=images,
@@ -398,15 +404,20 @@ class DriftingVLATrainer:
                     noise=noise,
                     embodiment_id=embodiment_id,
                     cfg_scale=cfg_scale,
+                    proprio=proprio,
+                    num_views=num_views,
+                    num_frames=num_frames,
                 )
             else:
-                # Use pre-computed VLM features
                 actions_pred = self.model(
                     vlm_features=vlm_features,
                     vlm_pooled=vlm_pooled,
                     noise=noise,
                     embodiment_id=embodiment_id,
                     cfg_scale=cfg_scale,
+                    proprio=proprio,
+                    num_views=num_views,
+                    num_frames=num_frames,
                     vlm_attn_mask=vlm_attn_mask,
                 )  # [B, T, 128]
             
