@@ -1,41 +1,25 @@
 """
-Drifting-VLA: Vision-Language-Action Policy with Drifting Model
-================================================================
+Drifting-VLA: VLM-Conditioned One-Step Action Generation
+=============================================================
 
-A PyTorch implementation of Drifting-VLA, which leverages the training-time
-distribution evolution paradigm of Drifting models to learn multimodal action
-policies conditioned on vision and language, achieving one-step inference
-without iterative sampling.
+A unified foundation model for multi-embodiment robotic manipulation
+using Drifting models for one-step action generation conditioned on
+Vision-Language Model (VLM) features.
 
 Main Components:
-    - models: Neural network architectures (DiT, encoders, decoders)
-    - training: Drifting field computation and training utilities
-    - data: Dataset loaders and data collection
-    - envs: Environment wrappers (RLBench, LIBERO, CALVIN)
-    - inference: One-step policy inference
-    - logging: WandB integration and visualization
-
-Example:
-    >>> from drifting_vla.models import DriftingVLA
-    >>> from drifting_vla.training import DriftingVLATrainer
-    >>> 
-    >>> model = DriftingVLA(config)
-    >>> trainer = DriftingVLATrainer(model, train_loader, val_loader, config)
-    >>> trainer.train()
+    - models: DriftingVLA, VLM backbone, DiT transformer
+    - training: Drifting loss, EMA, drifting field computation
+    - data: Unified multi-dataset loader, action mapping
 """
 
-__version__ = "0.1.0"
+__version__ = "2.0.0"
 __author__ = "Drifting-VLA Team"
 
-from drifting_vla.models.drifting_vla import DriftingVLA
-from drifting_vla.training.trainer import DriftingVLATrainer
-from drifting_vla.training.losses import DriftingLoss, FeatureSpaceLoss
+from drifting_vla.models.drifting_vla import DriftingVLA, DriftingVLAConfig
+from drifting_vla.training.losses import DriftingLoss
 
 __all__ = [
     "DriftingVLA",
-    "DriftingVLATrainer", 
+    "DriftingVLAConfig",
     "DriftingLoss",
-    "FeatureSpaceLoss",
 ]
-
-

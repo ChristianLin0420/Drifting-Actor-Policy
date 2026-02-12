@@ -1,13 +1,11 @@
 """
 Drifting-VLA Training Module
-============================
+================================
 
-This module contains the core training components for Drifting-VLA:
-    - drifting_field: Algorithm for computing the drifting field V_{p,q}(x)
-    - losses: Drifting loss functions (action-space and feature-space)
-    - trainer: FSDP-enabled training loop
-    - optimizer: AdamW with learning rate schedulers
-    - ema: Exponential moving average for model parameters
+Core training components:
+    - drifting_field: Drifting field V_{p,q}(x) computation
+    - losses: Drifting loss + hybrid MSE loss
+    - ema: Exponential moving average
 """
 
 from drifting_vla.training.drifting_field import (
@@ -15,8 +13,7 @@ from drifting_vla.training.drifting_field import (
     compute_feature_normalization_scale,
     normalize_drift_field,
 )
-from drifting_vla.training.losses import DriftingLoss, FeatureSpaceLoss
-from drifting_vla.training.trainer import DriftingVLATrainer
+from drifting_vla.training.losses import DriftingLoss
 from drifting_vla.training.ema import EMA
 
 __all__ = [
@@ -24,9 +21,5 @@ __all__ = [
     "compute_feature_normalization_scale",
     "normalize_drift_field",
     "DriftingLoss",
-    "FeatureSpaceLoss",
-    "DriftingVLATrainer",
     "EMA",
 ]
-
-
