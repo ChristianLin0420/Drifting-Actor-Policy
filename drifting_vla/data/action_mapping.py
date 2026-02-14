@@ -13,10 +13,11 @@ Non-overlapping regions for different action representations:
   Padding:                               [56:127]=zeros                      (72 dims)
 
 Embodiment → Region mapping:
-  Single-arm EEF   (rlbench, utaustin_mutex, stanford_hydra, cmu_stretch) → Region A
-  Single-arm Joint (droid, bc_z, taco_play)                                → Region B
-  Bimanual         (aloha, nyu_franka, behavior1k)                         → Region C
-  Dexterous hand   (dexgraspnet)                                           → Region A (wrist) + D (fingers)
+  Single-arm EEF     (rlbench, utaustin_mutex, stanford_hydra, cmu_stretch) → Region A
+  Single-arm Joint   (droid, bc_z, taco_play)                                → Region B
+  Bimanual           (aloha, nyu_franka)                                     → Region C
+  Bimanual + Mobile  (behavior1k R1Pro)                                      → Region C (16 arm) + Region E (7 base/torso)
+  Dexterous hand     (dexgraspnet)                                           → Region A (wrist) + D (fingers)
 """
 
 import numpy as np
@@ -42,9 +43,10 @@ REGION_EXTRA_END = 56
 # Embodiment IDs
 EMBODIMENT_GRIPPER_EEF = 0       # Single arm, absolute EEF pose control
 EMBODIMENT_GRIPPER_JOINT = 1     # Single arm, joint position control
-EMBODIMENT_BIMANUAL = 2          # Two arms, joint control
+EMBODIMENT_BIMANUAL = 2          # Two arms, joint control (≤16 dims)
 EMBODIMENT_DEXHAND = 3           # Dexterous hand (wrist EEF + finger joints)
 EMBODIMENT_GRIPPER_DELTA_EEF = 4 # Single arm, delta EEF control
+EMBODIMENT_BIMANUAL_MOBILE = 5   # Bimanual + base/torso (>16 dims, e.g. R1Pro 23-dim)
 
 # Legacy alias
 EMBODIMENT_GRIPPER = 0
@@ -55,6 +57,7 @@ EMBODIMENT_NAMES = {
     2: 'bimanual',
     3: 'dex_hand',
     4: 'gripper_delta_eef',
+    5: 'bimanual_mobile',
 }
 
 # ─── Dataset Registry ───
@@ -74,7 +77,8 @@ DATASET_EMBODIMENT = {
     # Bimanual → Region C [16:32]
     'aloha': EMBODIMENT_BIMANUAL,
     'nyu_franka': EMBODIMENT_BIMANUAL,
-    **{f'behavior1k_t{i:04d}': EMBODIMENT_BIMANUAL for i in range(50)},
+    # Bimanual + Mobile (R1Pro: 16 arm + 7 base/torso) → Region C + Region E
+    **{f'behavior1k_t{i:04d}': EMBODIMENT_BIMANUAL_MOBILE for i in range(50)},
     # Dexterous hand → Region A (wrist) + Region D (fingers)
     'dexgraspnet': EMBODIMENT_DEXHAND,
 }
@@ -141,35 +145,61 @@ class ActionMaskInfo:
     quat_dims: Optional[list]
 
 
-def get_action_mask(embodiment_id: int) -> ActionMaskInfo:
-    """Get the action mask for an embodiment type."""
+def get_action_mask(embodiment_id: int, native_dim: Optional[int] = None) -> ActionMaskInfo:
+    """Get the action mask for an embodiment type.
+    
+    Args:
+        embodiment_id: Which embodiment (determines which region).
+        native_dim: Actual number of native action dims for this dataset.
+            If provided, the mask is tightened to only cover exactly
+            native_dim positions within the region (no over-counting).
+            Example: aloha has native_dim=14 in bimanual region [16:32],
+            so only [16:30] is marked active (not the full [16:32]).
+    """
     mask = np.zeros(UNIFIED_ACTION_DIM, dtype=bool)
 
     if embodiment_id == EMBODIMENT_GRIPPER_EEF:
         # Region A: [0:8]
-        mask[REGION_EEF_START:REGION_EEF_END] = True
-        return ActionMaskInfo(mask=mask, active_dims=8, native_dim=8, quat_dims=[3, 4, 5, 6])
+        n = min(native_dim, 8) if native_dim else 8
+        mask[REGION_EEF_START:REGION_EEF_START + n] = True
+        quat_dims = [3, 4, 5, 6] if n >= 7 else None
+        return ActionMaskInfo(mask=mask, active_dims=n, native_dim=n, quat_dims=quat_dims)
 
     elif embodiment_id == EMBODIMENT_GRIPPER_JOINT:
         # Region B: [8:16]
-        mask[REGION_JOINT_START:REGION_JOINT_END] = True
-        return ActionMaskInfo(mask=mask, active_dims=8, native_dim=8, quat_dims=None)
+        n = min(native_dim, 8) if native_dim else 8
+        mask[REGION_JOINT_START:REGION_JOINT_START + n] = True
+        return ActionMaskInfo(mask=mask, active_dims=n, native_dim=n, quat_dims=None)
 
     elif embodiment_id == EMBODIMENT_BIMANUAL:
         # Region C: [16:32]
-        mask[REGION_BIMANUAL_START:REGION_BIMANUAL_END] = True
-        return ActionMaskInfo(mask=mask, active_dims=16, native_dim=16, quat_dims=None)
+        n = min(native_dim, 16) if native_dim else 16
+        mask[REGION_BIMANUAL_START:REGION_BIMANUAL_START + n] = True
+        return ActionMaskInfo(mask=mask, active_dims=n, native_dim=n, quat_dims=None)
 
     elif embodiment_id == EMBODIMENT_DEXHAND:
         # Region A [0:7] (wrist EEF) + Region D [32:48] (fingers)
-        mask[REGION_EEF_START:REGION_EEF_START + 7] = True
-        mask[REGION_HAND_START:REGION_HAND_END] = True
-        return ActionMaskInfo(mask=mask, active_dims=23, native_dim=23, quat_dims=[3, 4, 5, 6])
+        n_wrist = 7
+        n_fingers = min(native_dim - 7, 16) if native_dim and native_dim > 7 else 16
+        mask[REGION_EEF_START:REGION_EEF_START + n_wrist] = True
+        mask[REGION_HAND_START:REGION_HAND_START + n_fingers] = True
+        total = n_wrist + n_fingers
+        return ActionMaskInfo(mask=mask, active_dims=total, native_dim=total, quat_dims=[3, 4, 5, 6])
 
     elif embodiment_id == EMBODIMENT_GRIPPER_DELTA_EEF:
-        # Region E [48:56] — delta EEF (separate from absolute EEF at [0:8])
-        mask[REGION_EXTRA_START:REGION_EXTRA_END] = True
-        return ActionMaskInfo(mask=mask, active_dims=8, native_dim=8, quat_dims=None)
+        # Region E [48:56] — delta EEF
+        n = min(native_dim, 8) if native_dim else 8
+        mask[REGION_EXTRA_START:REGION_EXTRA_START + n] = True
+        return ActionMaskInfo(mask=mask, active_dims=n, native_dim=n, quat_dims=None)
+
+    elif embodiment_id == EMBODIMENT_BIMANUAL_MOBILE:
+        # Region C [16:32] (bimanual arms) + Region E [48:55] (base/torso)
+        n_arms = 16
+        n_extra = min(native_dim - 16, 8) if native_dim and native_dim > 16 else 7
+        mask[REGION_BIMANUAL_START:REGION_BIMANUAL_START + n_arms] = True
+        mask[REGION_EXTRA_START:REGION_EXTRA_START + n_extra] = True
+        total = n_arms + n_extra
+        return ActionMaskInfo(mask=mask, active_dims=total, native_dim=total, quat_dims=None)
 
     else:
         raise ValueError(f"Unknown embodiment_id: {embodiment_id}")
@@ -220,6 +250,16 @@ def map_to_unified(action: np.ndarray, embodiment_id: int) -> np.ndarray:
         n = min(D_native, 8)
         unified[:, REGION_EXTRA_START:REGION_EXTRA_START + n] = action[:, :n]
 
+    elif embodiment_id == EMBODIMENT_BIMANUAL_MOBILE:
+        # Bimanual mobile → Region C [16:32] (arms) + Region E [48:55] (base/torso)
+        # First 16 dims = bimanual arms
+        n_arms = min(D_native, 16)
+        unified[:, REGION_BIMANUAL_START:REGION_BIMANUAL_START + n_arms] = action[:, :n_arms]
+        # Remaining dims (17-23) = base/torso/head → Region E
+        if D_native > 16:
+            n_extra = min(D_native - 16, 7)
+            unified[:, REGION_EXTRA_START:REGION_EXTRA_START + n_extra] = action[:, 16:16 + n_extra]
+
     if not is_sequence:
         return unified[0]
     return unified
@@ -243,6 +283,10 @@ def extract_from_unified(unified: np.ndarray, embodiment_id: int) -> np.ndarray:
         action = np.concatenate([wrist, fingers], axis=-1)
     elif embodiment_id == EMBODIMENT_GRIPPER_DELTA_EEF:
         action = unified[:, REGION_EXTRA_START:REGION_EXTRA_END]
+    elif embodiment_id == EMBODIMENT_BIMANUAL_MOBILE:
+        arms = unified[:, REGION_BIMANUAL_START:REGION_BIMANUAL_END]  # [T, 16]
+        extra = unified[:, REGION_EXTRA_START:REGION_EXTRA_START + 7]  # [T, 7]
+        action = np.concatenate([arms, extra], axis=-1)  # [T, 23]
     else:
         raise ValueError(f"Unknown embodiment_id: {embodiment_id}")
 

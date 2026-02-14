@@ -136,7 +136,7 @@ class VLMBackbone(nn.Module):
             self.processor = AutoProcessor.from_pretrained(self.hf_name)
             self.vlm = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.hf_name,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
             ).to(device)
             self.vlm.eval()
             
@@ -155,7 +155,7 @@ class VLMBackbone(nn.Module):
             self.processor = AutoProcessor.from_pretrained(self.hf_name)
             self.vlm = PaliGemmaForConditionalGeneration.from_pretrained(
                 self.hf_name,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
             ).to(device)
             self.vlm.eval()
             

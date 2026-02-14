@@ -106,33 +106,60 @@ class UnifiedDataset(Dataset):
         )
     
     def _compute_all_action_stats(self):
-        """Compute action normalization statistics for each dataset."""
+        """Compute action normalization statistics for each dataset.
+        
+        Uses RDT-1B style robust [-1, 1] normalization:
+          1. Compute mean/std per dataset per dim
+          2. Clip outliers at ±5 std
+          3. Compute robust min/max from clipped range
+          4. Normalize to [-1, 1]: x_norm = (x - center) / half_range
+          
+        This prevents outlier actions (e.g., behavior1k base/torso) from
+        producing normalized values of 100+ which destabilize training.
+        """
         for name, ds in self.datasets.items():
             if hasattr(ds, 'compute_action_statistics'):
                 mean, std = ds.compute_action_statistics()
                 
                 # Map to unified space
+                from drifting_vla.data.action_mapping import DATASET_NATIVE_ACTION_DIM
                 embodiment_id = DATASET_EMBODIMENT.get(name, 0)
+                native_dim = DATASET_NATIVE_ACTION_DIM.get(name, None)
                 unified_mean = map_to_unified(mean, embodiment_id)
                 unified_std = map_to_unified(std, embodiment_id)
                 
-                # Set std of inactive dims to 1 (avoid division by zero)
-                mask_info = get_action_mask(embodiment_id)
-                unified_std[~mask_info.mask] = 1.0
-                # Clamp min std to 0.01 — prevents normalization blowup
-                # (e.g., quaternion dims with std=0.009 would amplify by 100×)
-                unified_std = np.maximum(unified_std, 0.01)
+                mask_info = get_action_mask(embodiment_id, native_dim=native_dim)
+                
+                # Robust [-1, 1] normalization (RDT-1B style)
+                # Clip range: mean ± 5*std → then normalize to [-1, 1]
+                clip_std = np.maximum(unified_std, 0.01)  # Min std to avoid zero-range
+                action_min = unified_mean - 5 * clip_std
+                action_max = unified_mean + 5 * clip_std
+                action_center = (action_min + action_max) / 2  # ≈ mean
+                action_half_range = (action_max - action_min) / 2  # ≈ 5*std
+                action_half_range = np.maximum(action_half_range, 0.01)
+                
+                # Inactive dims: center=0, half_range=1 (identity normalization)
+                action_center[~mask_info.mask] = 0.0
+                action_half_range[~mask_info.mask] = 1.0
                 
                 self.action_stats[name] = {
-                    'mean': unified_mean,
+                    'center': action_center,
+                    'half_range': action_half_range,
+                    'mean': unified_mean,   # Keep for backward compat
                     'std': unified_std,
                     'native_mean': mean,
                     'native_std': std,
                 }
-                logger.info(f"Action stats for {name}: mean_norm={np.linalg.norm(mean):.4f}")
+                logger.info(
+                    f"Action stats for {name}: mean_norm={np.linalg.norm(mean):.4f}, "
+                    f"max_half_range={action_half_range[mask_info.mask].max():.4f}"
+                )
             else:
                 logger.warning(f"Dataset {name} doesn't support action stats, using identity")
                 self.action_stats[name] = {
+                    'center': np.zeros(UNIFIED_ACTION_DIM, dtype=np.float32),
+                    'half_range': np.ones(UNIFIED_ACTION_DIM, dtype=np.float32),
                     'mean': np.zeros(UNIFIED_ACTION_DIM, dtype=np.float32),
                     'std': np.ones(UNIFIED_ACTION_DIM, dtype=np.float32),
                 }
@@ -148,9 +175,11 @@ class UnifiedDataset(Dataset):
         # Load raw sample from source dataset
         raw_sample = ds[local_idx]
         
-        # Get embodiment info
+        # Get embodiment info with exact native dim for tight masking
+        from drifting_vla.data.action_mapping import DATASET_NATIVE_ACTION_DIM
         embodiment_id = DATASET_EMBODIMENT.get(dataset_name, 0)
-        mask_info = get_action_mask(embodiment_id)
+        native_dim = DATASET_NATIVE_ACTION_DIM.get(dataset_name, None)
+        mask_info = get_action_mask(embodiment_id, native_dim=native_dim)
         
         # --- Convert actions to 128-dim unified space ---
         actions = raw_sample['actions']
@@ -160,10 +189,12 @@ class UnifiedDataset(Dataset):
         # Map to unified space
         unified_actions = map_to_unified(actions, embodiment_id)
         
-        # Normalize
+        # Normalize to [-1, 1] (RDT-1B style robust normalization)
         if self.normalize_actions and dataset_name in self.action_stats:
             stats = self.action_stats[dataset_name]
-            unified_actions = (unified_actions - stats['mean']) / stats['std']
+            unified_actions = (unified_actions - stats['center']) / stats['half_range']
+            # Clip to [-1, 1] to handle outliers beyond 5-sigma
+            unified_actions = np.clip(unified_actions, -1.0, 1.0)
         
         # --- Process images ---
         images = raw_sample['images']
@@ -256,29 +287,51 @@ class UnifiedDataset(Dataset):
 def create_weighted_sampler(
     unified_dataset: UnifiedDataset,
     weights: Optional[Dict[str, float]] = None,
+    temperature: float = 0.5,
 ) -> WeightedRandomSampler:
     """
-    Create a weighted random sampler for multi-dataset training.
+    Create a temperature-balanced weighted sampler for multi-dataset training.
+    
+    RDT-1B style: sample each dataset with probability proportional to
+    N_i^temperature where N_i is the dataset size. temperature=0.5 (square root)
+    prevents large datasets from dominating while still giving them more weight.
     
     Args:
         unified_dataset: UnifiedDataset instance.
-        weights: Per-dataset sampling weights (e.g., {'rlbench': 0.5, 'dexgraspnet': 0.5}).
-                 If None, uniform weights.
+        weights: Optional explicit per-dataset weights (overrides temperature).
+        temperature: Sampling temperature. 0=uniform across datasets, 1=proportional
+                     to size, 0.5=square root (RDT-1B default).
     
     Returns:
         WeightedRandomSampler for DataLoader.
     """
-    if weights is None:
-        # Uniform per-sample weights (each dataset proportional to size)
-        sample_weights = np.ones(len(unified_dataset), dtype=np.float64)
+    # Count samples per dataset
+    ds_counts = {}
+    for ds_name, _ in unified_dataset.global_index:
+        ds_counts[ds_name] = ds_counts.get(ds_name, 0) + 1
+    
+    if weights is not None:
+        # Explicit weights
+        ds_weights = weights
     else:
-        # Assign weight based on source dataset
-        sample_weights = np.zeros(len(unified_dataset), dtype=np.float64)
-        
-        for i, (ds_name, _) in enumerate(unified_dataset.global_index):
-            ds_size = sum(1 for n, _ in unified_dataset.global_index if n == ds_name)
-            w = weights.get(ds_name, 1.0)
-            sample_weights[i] = w / ds_size  # Normalize by dataset size
+        # Temperature-based balancing (RDT-1B style)
+        # p_i ∝ N_i^temperature
+        total_temp = sum(n ** temperature for n in ds_counts.values())
+        ds_weights = {name: (count ** temperature) / total_temp
+                      for name, count in ds_counts.items()}
+    
+    # Assign per-sample weights
+    sample_weights = np.zeros(len(unified_dataset), dtype=np.float64)
+    for i, (ds_name, _) in enumerate(unified_dataset.global_index):
+        # Weight for this sample = dataset_weight / dataset_size
+        # so all samples within a dataset have equal probability
+        sample_weights[i] = ds_weights.get(ds_name, 1.0) / ds_counts[ds_name]
+    
+    # Log sampling distribution
+    total_weight = sum(ds_weights.values())
+    for name in sorted(ds_counts.keys()):
+        pct = ds_weights.get(name, 0) / (total_weight + 1e-8) * 100
+        logger.info(f"  Sampling {name}: {ds_counts[name]} samples, weight={pct:.1f}%")
     
     return WeightedRandomSampler(
         weights=sample_weights,

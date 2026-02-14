@@ -52,8 +52,8 @@ class DriftingVLAConfig:
     noise_dim: int = 64
     action_dim: int = UNIFIED_ACTION_DIM  # 128
 
-    # Multi-embodiment (0=abs_eef, 1=joints, 2=bimanual, 3=dex_hand, 4=delta_eef)
-    num_embodiments: int = 5
+    # Multi-embodiment (0=abs_eef, 1=joints, 2=bimanual, 3=dex_hand, 4=delta_eef, 5=bimanual_mobile)
+    num_embodiments: int = 6
 
     # Proprioception (RDT-1B style)
     use_proprio: bool = True

@@ -145,7 +145,8 @@ Different action representations (absolute EEF, joint positions, delta EEF) are 
 |----|-----------|--------|-------------|----------|
 | 0 | `gripper_eef` | A `[0:8]` | 8 | rlbench |
 | 1 | `gripper_joint` | B `[8:16]` | 8 | droid, bc_z, taco_play |
-| 2 | `bimanual` | C `[16:32]` | 16 | aloha, nyu_franka, behavior1k (×50) |
+| 2 | `bimanual` | C `[16:32]` | 14-16 | aloha (14), nyu_franka (15) |
+| 5 | `bimanual_mobile` | C `[16:32]` + E `[48:55]` | 23 | behavior1k (×50): arms(16) + base/torso(7) |
 | 3 | `dex_hand` | A `[0:7]` + D `[32:48]` | 23 | dexgraspnet |
 | 4 | `gripper_delta_eef` | E `[48:56]` | 8 | utaustin_mutex, stanford_hydra, cmu_stretch |
 
@@ -160,7 +161,7 @@ bc_z               [j0,j1,j2,j3,j4,j5,j6]           7   joint position   → Reg
 taco_play          [j0,j1,j2,j3,j4,j5,j6]           7   joint position   → Region B [8:15]    [8,9,10,11,12,13,14]
 aloha              [Lj0..Lj6, Rj0..Rj6]             14  absolute joints  → Region C [16:30]   [16..29]
 nyu_franka         [Lj0..Lj7, Rj0..Rj6]             15  absolute joints  → Region C [16:31]   [16..30]
-behavior1k (×50)   [23-dim bimanual state]           23  absolute joints  → Region C [16:32]   [16..31]
+behavior1k (×50)   [23-dim bimanual+base]            23  absolute joints  → C[16:32]+E[48:55]  [16..31, 48..54]
 dexgraspnet        [wx,wy,wz,qx,qy,qz,qw, f0..f15] 23  absolute EEF+j   → A[0:7] + D[32:48] [0..6, 32..47]
 utaustin_mutex     [Δx,Δy,Δz,Δrx,Δry,Δrz,grip]      7  delta EEF        → Region E [48:55]   [48..54]
 stanford_hydra     [Δx,Δy,Δz,Δrx,Δry,Δrz,grip]      7  delta EEF        → Region E [48:55]   [48..54]
@@ -179,7 +180,7 @@ bc_z:           ········ ████████ ···········
 taco_play:      ········ ████████ ················ ················ ·········· ·······
 aloha:          ········ ·········· ██████████████ ················ ·········· ·······
 nyu_franka:     ········ ·········· ███████████████ ················ ·········· ·······
-behavior1k:     ········ ·········· ████████████████ ················ ·········· ·······
+behavior1k:     ········ ·········· ████████████████ ················ ███████·· ·······
 dexgraspnet:    ███████· ·········· ················ ████████████████ ·········· ·······
 utaustin_mutex: ········ ·········· ················ ················ ████████ ·······
 stanford_hydra: ········ ·········· ················ ················ ████████ ·······
@@ -190,16 +191,28 @@ cmu_stretch:    ········ ·········· ·············
 
 **Key design:** Absolute EEF and delta EEF occupy different regions — no semantic overlap. Dex hand wrist shares Region A with absolute EEF intentionally (same `[x,y,z,qx,qy,qz,qw]` format).
 
-### 3.5 Action Normalization
+### 3.5 Action Normalization (RDT-1B Style Robust [-1, 1])
 
-Per-dataset z-normalization with **minimum std clamped to 0.01** to prevent quaternion blowup:
+**Outlier-robust range normalization** following RDT-1B/Octo best practices. This is critical for stable multi-dataset training where different embodiments have vastly different action scales (e.g., behavior1k base/torso joints have very different range than aloha arm joints).
 
 ```python
-unified_std = np.maximum(unified_std, 0.01)  # Max 100× amplification
-normalized_action = (action - mean) / std
+# Step 1: Compute per-dataset mean/std in unified space
+unified_mean = map_to_unified(native_mean, embodiment_id)
+unified_std = map_to_unified(native_std, embodiment_id)
+clip_std = max(unified_std, 0.01)  # Min std to prevent zero-range
+
+# Step 2: Compute robust [-1, 1] range (clip outliers at ±5 std)
+action_min = unified_mean - 5 * clip_std
+action_max = unified_mean + 5 * clip_std
+center = (action_min + action_max) / 2
+half_range = (action_max - action_min) / 2
+
+# Step 3: Normalize to [-1, 1] + clip
+normalized = (action - center) / half_range
+normalized = clip(normalized, -1.0, 1.0)
 ```
 
-Without this clamp, quaternion dims (std ≈ 0.009) amplify values by 10,000× → MSE loss in millions.
+**Why not z-score (`(x-μ)/σ`)?** Z-score normalization produces unbounded values. A single outlier action (e.g., behavior1k base velocity spike) can produce normalized values of 100+, causing MSE loss spikes of 10,000+ that destabilize the entire training. Range normalization to [-1, 1] guarantees bounded loss regardless of outliers.
 
 ### 3.2 Image Processing (Pi0-Style Variable Views)
 
@@ -426,7 +439,7 @@ torchrun --nproc_per_node=8 scripts/train.py \
 | `--batch-size` | 16 | Per-GPU batch size |
 | `--grad-accumulation` | 2 | Gradient accumulation steps |
 | `--max-steps` | 10000 | Total training steps |
-| `--lr` | 4e-4 | Learning rate |
+| `--lr` | 1e-4 | Learning rate (RDT-1B style, stable for multi-dataset) |
 | `--loss-type` | `'hybrid'` | `'mse'`, `'pure_drift'`, or `'hybrid'` |
 | `--drift-weight` | 0.1 | Weight for drifting loss in hybrid mode |
 | `--vlm` | `'qwen3vl'` | VLM backbone (`'qwen3vl'` or `'paligemma2'`) |
@@ -463,10 +476,13 @@ $$V(\mathbf{a}) = \mathbb{E}_{y^+, y^-}[\tilde{k}(\mathbf{a}, y^+)\tilde{k}(\mat
 - Positive samples from dataset queue
 - Negative samples from prediction queue
 
-**Typical values:**
-- MSE loss: 10-1000 (decreases during training)
-- Drift loss: ~1.0 (constant by design)
-- Grad norm: 5-50 (clipped to 2.0)
+**Per-Embodiment Drifting (Fix for cross-embodiment noise):**
+The positive/negative sample queues are separated by embodiment type. Without this, bc_z samples (active: `[8:16]`) and aloha samples (active: `[16:32]`) are orthogonal in 128-dim space, producing noisy drift fields. Per-embodiment queues ensure the drift field only operates between semantically compatible actions.
+
+**Typical values (with [-1,1] normalization):**
+- MSE loss: 0.01-1.0 (decreases during training, bounded thanks to [-1,1] normalization)
+- Drift loss: ~1.0 (constant by design, with drift normalization)
+- Grad norm: 0.1-2.0 (clipped to 1.0)
 
 ---
 
@@ -520,7 +536,11 @@ Drifting-Actor-Policy/
 | **Proprio** | Robot state z_t (128-dim) | RDT-1B style: model knows current robot state |
 | **Camera embeds** | Learned per-camera + per-timestep | DiT disambiguates which token from which camera/time |
 | **Action space** | 128-dim, 5 non-overlapping regions | Abs EEF, Joints, Bimanual, Dex, Delta EEF separated |
-| **Normalization** | Per-dataset z-score, min_std=0.01 | Prevents quaternion blowup (MSE: millions → hundreds) |
+| **Normalization** | Robust [-1,1] range (RDT-1B style) | Outlier-proof: 5σ clip → bounded MSE regardless of data scale |
+| **Dataset sampling** | Temperature-balanced (α=0.5, √N) | Prevents large datasets from dominating (RDT-1B/Octo style) |
+| **Drift queues** | Per-embodiment pos/neg queues | Avoids cross-embodiment noise in drifting field |
+| **Learning rate** | 1e-4 with cosine decay | Lower LR for multi-dataset stability (4e-4 too aggressive) |
+| **Grad clip** | 1.0 | Tighter clipping for mixed-embodiment batches |
 | **Datasets** | 60 total | 10 OXE + 50 Behavior 1K + RLBench + DexGraspNet |
 | **Loss** | Hybrid MSE + Drifting | MSE for convergence, drifting for multi-modality |
 
