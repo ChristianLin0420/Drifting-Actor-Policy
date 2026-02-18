@@ -399,7 +399,7 @@ class DexGraspNetDataset:
             action = np.zeros(23, dtype=np.float32)
             action[:min(17, len(pose))] = pose[:17]
         except Exception:
-        action = np.zeros(23, dtype=np.float32)
+            action = np.zeros(23, dtype=np.float32)
         
         # Try to load scene images
         images = self._load_scene_images(info.get('scene_imgs_dir'))
@@ -487,20 +487,20 @@ class DexGraspNetDataset:
                 data = h5_file[key]
                 if hasattr(data, 'shape') and data.ndim >= 3 and idx < data.shape[0]:
                     import cv2
-                        img = np.array(data[idx], dtype=np.uint8)
-        if img.ndim == 3:
+                    img = np.array(data[idx], dtype=np.uint8)
+                    if img.ndim == 3:
                         img = img[np.newaxis]
-        V = img.shape[0]
-        result = np.zeros((V, 3, self.image_size, self.image_size), dtype=np.float32)
-        for v in range(V):
-            frame = img[v]
-            if frame.shape[0] != self.image_size or frame.shape[1] != self.image_size:
-                frame = cv2.resize(frame, (self.image_size, self.image_size))
-            result[v] = frame.transpose(2, 0, 1).astype(np.float32) / 255.0
-        return result
-    
+                    V = img.shape[0]
+                    result = np.zeros((V, 3, self.image_size, self.image_size), dtype=np.float32)
+                    for v in range(V):
+                        frame = img[v]
+                        if frame.shape[0] != self.image_size or frame.shape[1] != self.image_size:
+                            frame = cv2.resize(frame, (self.image_size, self.image_size))
+                        result[v] = frame.transpose(2, 0, 1).astype(np.float32) / 255.0
+                    return result
+
         return np.zeros((1, 3, self.image_size, self.image_size), dtype=np.float32)
-    
+
     def _get_h5_language(self, h5_file, idx) -> str:
         """Get language from HDF5."""
         for key in ['descriptions', 'language', 'text', 'description']:

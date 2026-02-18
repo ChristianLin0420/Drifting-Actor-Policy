@@ -237,7 +237,7 @@ class CrossAttention(nn.Module):
                 attn = attn.masked_fill(kv_mask, float('-inf'))
             else:
                 # Legacy: [B, Lq, Lc] explicit mask
-            attn = attn.masked_fill(attention_mask.unsqueeze(1) == 0, float('-inf'))
+                attn = attn.masked_fill(attention_mask.unsqueeze(1) == 0, float('-inf'))
         
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)

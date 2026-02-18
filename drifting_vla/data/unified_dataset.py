@@ -146,8 +146,8 @@ class UnifiedDataset(Dataset):
                     unified_std = std
                 else:
                     # Legacy datasets: need mapping to unified space
-                unified_mean = map_to_unified(mean, embodiment_id)
-                unified_std = map_to_unified(std, embodiment_id)
+                    unified_mean = map_to_unified(mean, embodiment_id)
+                    unified_std = map_to_unified(std, embodiment_id)
                 
                 mask_info = get_action_mask(embodiment_id, native_dim=native_dim)
                 
@@ -423,8 +423,8 @@ def create_weighted_sampler(
                       for name, count in ds_counts.items()}
     
     # Assign per-sample weights
-        sample_weights = np.zeros(len(unified_dataset), dtype=np.float64)
-        for i, (ds_name, _) in enumerate(unified_dataset.global_index):
+    sample_weights = np.zeros(len(unified_dataset), dtype=np.float64)
+    for i, (ds_name, _) in enumerate(unified_dataset.global_index):
         # Weight for this sample = dataset_weight / dataset_size
         # so all samples within a dataset have equal probability
         sample_weights[i] = ds_weights.get(ds_name, 1.0) / ds_counts[ds_name]

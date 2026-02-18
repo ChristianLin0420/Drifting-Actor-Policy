@@ -232,17 +232,17 @@ class DriftingVLATrainer:
             if not ep_dir.exists() or not (ep_dir / 'metadata.json').exists():
                 if self.is_main:
                     logger.warning(f"Episode dir not found: {ep_dir}, skipping {ds_name}")
-                        continue
+                continue
             
             try:
                 ds = EpisodeHDF5Dataset(
                     episode_dir=str(ep_dir),
-                        action_horizon=cfg.action_horizon,
+                    action_horizon=cfg.action_horizon,
                     num_history_frames=3,
-                        image_size=cfg.image_size,
+                    image_size=cfg.image_size,
                     max_samples=max_samples,
                     vlm_processor=vlm_processor,
-                    )
+                )
                 
                 # Apply data fraction: subsample to percentage of total
                 if 0.0 < data_fraction < 1.0 and len(ds) > 0:
@@ -259,13 +259,13 @@ class DriftingVLATrainer:
                 if len(ds) > 0:
                     datasets[ds_name] = ds
                     if self.is_main:
-                    logger.info(f"  Loaded {ds_name}: {len(ds)} samples")
+                        logger.info(f"  Loaded {ds_name}: {len(ds)} samples")
                 else:
                     if self.is_main:
-                    logger.warning(f"  {ds_name} has 0 samples, skipping")
+                        logger.warning(f"  {ds_name} has 0 samples, skipping")
             except Exception as e:
                 if self.is_main:
-                logger.error(f"  Failed to load {ds_name}: {e}")
+                    logger.error(f"  Failed to load {ds_name}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
@@ -509,15 +509,15 @@ class DriftingVLATrainer:
 
         # Forward pass
         with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=cfg.use_amp):
-                actions_pred = self.model(
+            actions_pred = self.model(
                 **fwd_kwargs,
-                    noise=noise,
-                    embodiment_id=embodiment_id,
-                    cfg_scale=cfg_scale,
-                    proprio=proprio,
-                    num_views=num_views,
-                    num_frames=num_frames,
-                )  # [B, T, 128]
+                noise=noise,
+                embodiment_id=embodiment_id,
+                cfg_scale=cfg_scale,
+                proprio=proprio,
+                num_views=num_views,
+                num_frames=num_frames,
+            )  # [B, T, 128]
             
             # Apply action mask to predictions
             mask = action_mask.unsqueeze(1)  # [B, 1, 128]
@@ -588,7 +588,7 @@ class DriftingVLATrainer:
                             if loss_out.lambda_V is not None:
                                 lambda_Vs.append(loss_out.lambda_V.item())
                             loss_output = loss_out
-                except Exception:
+                    except Exception:
                         pass
                 
                 # Aggregate
@@ -691,9 +691,9 @@ class DriftingVLATrainer:
             running_loss += metrics['loss']
             for k, v in metrics.items():
                 if isinstance(v, (int, float)):
-                if k not in running_metrics:
-                    running_metrics[k] = 0.0
-                running_metrics[k] += v
+                    if k not in running_metrics:
+                        running_metrics[k] = 0.0
+                    running_metrics[k] += v
             
             # Logging
             if self.is_main and (step + 1) % cfg.log_every == 0:

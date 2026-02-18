@@ -262,17 +262,17 @@ class DriftingVLA(nn.Module):
         else:
             # ── Fallback: uniform division heuristic ──
             tokens_per_group = L // max(total_images, 1)
-        if tokens_per_group == 0:
-            return c_seq
+            if tokens_per_group == 0:
+                return c_seq
 
             for group_idx in range(min(total_images, L // max(tokens_per_group, 1))):
-            frame_idx = group_idx // num_views
-            cam_idx = group_idx % num_views
+                frame_idx = group_idx // num_views
+                cam_idx = group_idx % num_views
 
-            start = group_idx * tokens_per_group
-            end = start + tokens_per_group
-            if end > L:
-                end = L
+                start = group_idx * tokens_per_group
+                end = start + tokens_per_group
+                if end > L:
+                    end = L
 
                 cam_id = torch.tensor(
                     min(cam_idx, self.config.max_cameras - 1), device=device
