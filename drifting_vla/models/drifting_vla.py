@@ -197,6 +197,7 @@ class DriftingVLA(nn.Module):
         c_seq: torch.Tensor,
         num_views: int = 1,
         num_frames: int = 1,
+        tokens_per_image: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """
         Add camera ID + timestep positional embeddings to VLM feature tokens.
@@ -205,10 +206,20 @@ class DriftingVLA(nn.Module):
         tokens from all (frame, camera) combinations. We add learned embeddings so
         the DiT can distinguish which tokens came from which camera and timestep.
 
+        Image ordering is frame-major, view-minor:
+            img[0] = (t-1, cam_0)  →  camera_id=0, time_id=0
+            img[1] = (t-1, cam_1)  →  camera_id=1, time_id=0
+            img[2] = (t,   cam_0)  →  camera_id=0, time_id=1
+            ...
+        Language tokens (at the end) receive no camera/time embedding.
+
         Args:
             c_seq: [B, L, D] projected VLM features
             num_views: Number of camera views per frame
             num_frames: Number of history frames (1 or 3 typically)
+            tokens_per_image: If provided, exact token count per image from VLM
+                processor's image_grid_thw. Enables precise per-token assignment.
+                Length should equal num_views * num_frames.
         Returns:
             c_seq with camera+time embeddings added
         """
@@ -221,14 +232,40 @@ class DriftingVLA(nn.Module):
             c_seq = c_seq + self.history_time_embed(torch.zeros(1, dtype=torch.long, device=device))
             return c_seq
 
-        # Estimate tokens per view-frame group
-        total_groups = num_views * num_frames
-        tokens_per_group = L // max(total_groups, 1)
+        total_images = num_views * num_frames
 
+        if tokens_per_image is not None and len(tokens_per_image) == total_images:
+            # ── Precise mode: exact per-token assignment from VLM processor ──
+            offset = 0
+            for img_idx, n_tokens in enumerate(tokens_per_image):
+                frame_idx = img_idx // num_views
+                cam_idx = img_idx % num_views
+
+                cam_id = torch.tensor(
+                    min(cam_idx, self.config.max_cameras - 1), device=device
+                )
+                time_id = torch.tensor(
+                    min(frame_idx, self.config.max_history_steps - 1), device=device
+                )
+
+                end = min(offset + n_tokens, L)
+                if offset >= L:
+                    break
+
+                c_seq[:, offset:end, :] = (
+                    c_seq[:, offset:end, :]
+                    + self.camera_embed(cam_id)
+                    + self.history_time_embed(time_id)
+                )
+                offset = end
+            # tokens[offset:L] = language tokens — no camera/time embed
+        else:
+            # ── Fallback: uniform division heuristic ──
+            tokens_per_group = L // max(total_images, 1)
         if tokens_per_group == 0:
             return c_seq
 
-        for group_idx in range(min(total_groups, L // max(tokens_per_group, 1))):
+            for group_idx in range(min(total_images, L // max(tokens_per_group, 1))):
             frame_idx = group_idx // num_views
             cam_idx = group_idx % num_views
 
@@ -237,71 +274,76 @@ class DriftingVLA(nn.Module):
             if end > L:
                 end = L
 
-            cam_id = torch.tensor(min(cam_idx, self.config.max_cameras - 1), device=device)
-            time_id = torch.tensor(min(frame_idx, self.config.max_history_steps - 1), device=device)
+                cam_id = torch.tensor(
+                    min(cam_idx, self.config.max_cameras - 1), device=device
+                )
+                time_id = torch.tensor(
+                    min(frame_idx, self.config.max_history_steps - 1), device=device
+                )
 
-            c_seq[:, start:end, :] = c_seq[:, start:end, :] + self.camera_embed(cam_id)
-            c_seq[:, start:end, :] = c_seq[:, start:end, :] + self.history_time_embed(time_id)
+                c_seq[:, start:end, :] = (
+                    c_seq[:, start:end, :]
+                    + self.camera_embed(cam_id)
+                    + self.history_time_embed(time_id)
+                )
 
         return c_seq
 
     def forward(
         self,
-        # VLM features (pre-computed or from live forward)
+        # VLM ViT encoder inputs (vision-encoder-only, from DataLoader workers)
+        vlm_pixel_values: Optional[torch.Tensor] = None,
+        vlm_image_grid_thw: Optional[torch.Tensor] = None,
+        vlm_input_ids: Optional[torch.Tensor] = None,
+        vlm_attention_mask: Optional[torch.Tensor] = None,
+        # Or pre-computed features (offline path)
         vlm_features: Optional[torch.Tensor] = None,
         vlm_pooled: Optional[torch.Tensor] = None,
-        # Or raw inputs for live VLM forward
-        images: Optional[torch.Tensor] = None,
-        language: Optional[List[str]] = None,
         # Action generation inputs
         noise: Optional[torch.Tensor] = None,
         embodiment_id: Optional[torch.Tensor] = None,
         cfg_scale: Optional[torch.Tensor] = None,
-        # NEW: Proprioception (robot state)
+        # Proprioception (robot state)
         proprio: Optional[torch.Tensor] = None,
         # Metadata for camera+time embeddings
         num_views: int = 1,
         num_frames: int = 1,
-        # Optional attention mask
-        vlm_attn_mask: Optional[torch.Tensor] = None,
+        tokens_per_image: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """
-        Forward pass.
-
-        Args:
-            vlm_features: [B, L, vlm_dim] pre-computed VLM hidden states.
-            vlm_pooled: [B, vlm_dim] pre-computed pooled features.
-            images: [B, V, 3, H, W] or [B, T_hist*V, 3, H, W] raw images.
-            language: List of B strings.
-            noise: [B, T, noise_dim] random noise.
-            embodiment_id: [B] embodiment type (0/1/2).
-            cfg_scale: [B] CFG scale.
-            proprio: [B, 128] proprioception in unified space (robot state).
-            num_views: Number of camera views per frame.
-            num_frames: Number of history frames.
-            vlm_attn_mask: [B, L] attention mask.
+        Forward pass with 2 VLM input modes:
+          1. Vision-encoder-only (vlm_pixel_values): ViT + text embed, skip LLM (production)
+          2. Pre-computed features (vlm_features): offline VLM, fastest inference
 
         Returns:
             actions: [B, T, 128] predicted actions.
         """
         # Determine batch size and device
-        if vlm_features is not None:
+        if vlm_input_ids is not None:
+            B = vlm_input_ids.shape[0]
+            device = vlm_input_ids.device
+        elif vlm_features is not None:
             B = vlm_features.shape[0]
             device = vlm_features.device
-        elif images is not None:
-            B = images.shape[0]
-            device = images.device
         else:
-            raise ValueError("Either vlm_features or images must be provided")
+            raise ValueError("Must provide vlm_input_ids or vlm_features")
 
-        # --- Get VLM context ---
-        if vlm_features is not None:
+        # --- Get VLM context (2 paths) ---
+        vlm_attn_mask = None
+        if vlm_input_ids is not None:
+            # Path 1: Vision-encoder-only — ViT + text embeddings (production training)
+            c_seq, c_pool, vlm_attn_mask = self.vlm_backbone.forward_encoder_only(
+                pixel_values=vlm_pixel_values,
+                image_grid_thw=vlm_image_grid_thw,
+                input_ids=vlm_input_ids,
+                attention_mask=vlm_attention_mask,
+            )
+        else:
+            # Path 2: Pre-computed features — offline VLM
             c_seq, c_pool = self.vlm_backbone.forward_precomputed(vlm_features, vlm_pooled)
-        else:
-            c_seq, c_pool = self.vlm_backbone.forward_live(images, language)
 
-        # --- NEW: Add camera + timestep positional embeddings ---
-        c_seq = self._add_camera_time_embeddings(c_seq, num_views, num_frames)
+        # --- Add camera + timestep positional embeddings ---
+        c_seq = self._add_camera_time_embeddings(c_seq, num_views, num_frames, tokens_per_image)
 
         # --- Sample noise ---
         if noise is None:
@@ -318,7 +360,7 @@ class DriftingVLA(nn.Module):
         cfg_emb = self.cfg_embed(cfg_scale.unsqueeze(-1))
         c_global = c_pool + emb_embed + cfg_emb
 
-        # --- NEW: Add proprioception to global conditioning ---
+        # --- Add proprioception to global conditioning ---
         if proprio is not None and self.proprio_embed is not None:
             proprio_emb = self.proprio_embed(proprio.float())
             c_global = c_global + proprio_emb
@@ -328,7 +370,7 @@ class DriftingVLA(nn.Module):
 
         # --- Cross-attention: noise attends to VLM context ---
         empty_lang = torch.zeros(B, 0, self.config.hidden_dim, device=device)
-        fused_tokens = self.cross_attn_fusion(noise_tokens, c_seq, empty_lang, None)
+        fused_tokens = self.cross_attn_fusion(noise_tokens, c_seq, empty_lang, vlm_attn_mask)
 
         # --- DiT transformer with adaLN ---
         transformer_out = self.transformer(fused_tokens, c_global)
@@ -341,27 +383,35 @@ class DriftingVLA(nn.Module):
     @torch.no_grad()
     def generate(
         self,
+        vlm_pixel_values: Optional[torch.Tensor] = None,
+        vlm_image_grid_thw: Optional[torch.Tensor] = None,
+        vlm_input_ids: Optional[torch.Tensor] = None,
+        vlm_attention_mask: Optional[torch.Tensor] = None,
         vlm_features: Optional[torch.Tensor] = None,
         vlm_pooled: Optional[torch.Tensor] = None,
-        images: Optional[torch.Tensor] = None,
-        language: Optional[List[str]] = None,
         embodiment_id: Optional[torch.Tensor] = None,
         cfg_scale: float = 2.0,
         proprio: Optional[torch.Tensor] = None,
         action_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Generate actions (inference mode, 1-NFE)."""
-        if vlm_features is not None:
+        if vlm_input_ids is not None:
+            B, device = vlm_input_ids.shape[0], vlm_input_ids.device
+        elif vlm_features is not None:
             B, device = vlm_features.shape[0], vlm_features.device
         else:
-            B, device = images.shape[0], images.device
+            raise ValueError("Must provide vlm_input_ids or vlm_features")
 
         if embodiment_id is None:
             embodiment_id = torch.zeros(B, dtype=torch.long, device=device)
 
         actions = self.forward(
-            vlm_features=vlm_features, vlm_pooled=vlm_pooled,
-            images=images, language=language,
+            vlm_pixel_values=vlm_pixel_values,
+            vlm_image_grid_thw=vlm_image_grid_thw,
+            vlm_input_ids=vlm_input_ids,
+            vlm_attention_mask=vlm_attention_mask,
+            vlm_features=vlm_features,
+            vlm_pooled=vlm_pooled,
             embodiment_id=embodiment_id,
             cfg_scale=torch.full((B,), cfg_scale, device=device),
             proprio=proprio,

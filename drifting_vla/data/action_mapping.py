@@ -81,6 +81,7 @@ DATASET_EMBODIMENT = {
     **{f'behavior1k_t{i:04d}': EMBODIMENT_BIMANUAL_MOBILE for i in range(50)},
     # Dexterous hand → Region A (wrist) + Region D (fingers)
     'dexgraspnet': EMBODIMENT_DEXHAND,
+    'dexwild': EMBODIMENT_DEXHAND,        # Real-world LEAP hand, 9.5K episodes, 5 tasks
 }
 
 # HuggingFace repos
@@ -96,6 +97,8 @@ DATASET_HF_REPOS = {
     'nyu_franka': 'lerobot/nyu_franka_play_dataset',
     'stanford_hydra': 'lerobot/stanford_hydra_dataset',
     **{f'behavior1k_t{i:04d}': f'lerobot/behavior1k-task{i:04d}' for i in range(50)},
+    # Dexterous hand datasets
+    'dexwild': 'boardd/dexwild-dataset',
 }
 
 LEROBOT_DATASETS = {
@@ -117,6 +120,8 @@ DATASET_NATIVE_ACTION_DIM = {
     'nyu_franka': 15,       # Bimanual: left(7) + right(7) + extra
     'stanford_hydra': 7,    # EEF: delta_xyz(3) + delta_rot(3) + gripper
     **{f'behavior1k_t{i:04d}': 23 for i in range(50)},
+    # Dexterous hand: wrist(7) + fingers(16) = 23 DOF
+    'dexwild': 23,    # LEAP hand v2: wrist_eef(7: xyz+quat) + finger_joints(16)
 }
 
 DATASET_ACTION_FORMAT = {
@@ -131,6 +136,7 @@ DATASET_ACTION_FORMAT = {
     'nyu_franka': 'absolute_joints',
     'stanford_hydra': 'delta_ee',
     **{f'behavior1k_t{i:04d}': 'absolute_joints' for i in range(50)},
+    'dexwild': 'absolute_ee',     # Wrist pose + finger joints
 }
 
 

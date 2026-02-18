@@ -43,12 +43,18 @@ class UnifiedDataset(Dataset):
     """
     Unified wrapper for multiple robotics datasets.
     
+    Supports two types of underlying datasets:
+      1. Legacy datasets (RLBenchDataset, LeRobotDataset, etc.) — actions in native space,
+         need map_to_unified() conversion.
+      2. EpisodeHDF5Dataset — actions already pre-mapped to 128-dim unified space,
+         skip mapping, use directly.
+    
     Each sample is converted to:
         - images: [V, 3, 448, 448] multi-view images
         - language: str
         - actions: [T, 128] unified action vector
         - action_mask: [128] boolean mask
-        - embodiment_id: int (0=gripper, 1=bimanual, 2=dex_hand)
+        - embodiment_id: int (0-5)
         - vlm_features: [L, D] pre-computed VLM features (if available)
         - vlm_pooled: [D] pre-computed pooled features (if available)
     
@@ -72,6 +78,15 @@ class UnifiedDataset(Dataset):
         self.image_size = image_size
         self.action_horizon = action_horizon
         self.normalize_actions = normalize_actions
+        
+        # Detect which datasets are pre-mapped (EpisodeHDF5Dataset)
+        from drifting_vla.data.episode_dataset import EpisodeHDF5Dataset
+        self._premapped = {
+            name for name, ds in datasets.items()
+            if isinstance(ds, EpisodeHDF5Dataset)
+        }
+        if self._premapped:
+            logger.info(f"Pre-mapped HDF5 datasets (skip map_to_unified): {self._premapped}")
         
         # Load VLM features if available
         self.vlm_h5_files = {}
@@ -121,10 +136,16 @@ class UnifiedDataset(Dataset):
             if hasattr(ds, 'compute_action_statistics'):
                 mean, std = ds.compute_action_statistics()
                 
-                # Map to unified space
                 from drifting_vla.data.action_mapping import DATASET_NATIVE_ACTION_DIM
                 embodiment_id = DATASET_EMBODIMENT.get(name, 0)
                 native_dim = DATASET_NATIVE_ACTION_DIM.get(name, None)
+                
+                if name in self._premapped:
+                    # HDF5 datasets: mean/std already in 128-dim unified space
+                    unified_mean = mean
+                    unified_std = std
+                else:
+                    # Legacy datasets: need mapping to unified space
                 unified_mean = map_to_unified(mean, embodiment_id)
                 unified_std = map_to_unified(std, embodiment_id)
                 
@@ -148,11 +169,11 @@ class UnifiedDataset(Dataset):
                     'half_range': action_half_range,
                     'mean': unified_mean,   # Keep for backward compat
                     'std': unified_std,
-                    'native_mean': mean,
-                    'native_std': std,
+                    'native_mean': mean if name not in self._premapped else unified_mean,
+                    'native_std': std if name not in self._premapped else unified_std,
                 }
                 logger.info(
-                    f"Action stats for {name}: mean_norm={np.linalg.norm(mean):.4f}, "
+                    f"Action stats for {name}: mean_norm={np.linalg.norm(unified_mean):.4f}, "
                     f"max_half_range={action_half_range[mask_info.mask].max():.4f}"
                 )
             else:
@@ -175,6 +196,82 @@ class UnifiedDataset(Dataset):
         # Load raw sample from source dataset
         raw_sample = ds[local_idx]
         
+        # ── Pre-mapped HDF5 datasets: pass through directly ──
+        if dataset_name in self._premapped:
+            return self._getitem_premapped(raw_sample, dataset_name, idx)
+        
+        # ── Legacy datasets: map to unified space ──
+        return self._getitem_legacy(raw_sample, dataset_name, idx)
+    
+    def _getitem_premapped(self, raw_sample: dict, dataset_name: str, idx: int) -> dict:
+        """Handle EpisodeHDF5Dataset samples (actions already in 128-dim unified space)."""
+        # Actions already [T, 128] in unified space
+        actions = raw_sample['actions']
+        if isinstance(actions, torch.Tensor):
+            actions_np = actions.numpy()
+        else:
+            actions_np = np.array(actions, dtype=np.float32)
+        
+        # Normalize to [-1, 1]
+        if self.normalize_actions and dataset_name in self.action_stats:
+            stats = self.action_stats[dataset_name]
+            actions_np = (actions_np - stats['center']) / stats['half_range']
+            actions_np = np.clip(actions_np, -1.0, 1.0)
+        
+        # Images already [N, 3, H, W] and correct size
+        images = raw_sample['images']
+        if isinstance(images, torch.Tensor):
+            images_t = images.float()
+        else:
+            images_t = torch.from_numpy(np.array(images, dtype=np.float32))
+        if images_t.ndim == 3:
+            images_t = images_t.unsqueeze(0)
+        
+        # Action mask already [128]
+        action_mask = raw_sample['action_mask']
+        if isinstance(action_mask, torch.Tensor):
+            action_mask_t = action_mask.float()
+        else:
+            action_mask_t = torch.from_numpy(np.array(action_mask, dtype=np.float32))
+        
+        # Proprio already [128]
+        proprio = raw_sample.get('proprio', torch.zeros(UNIFIED_ACTION_DIM))
+        if isinstance(proprio, torch.Tensor):
+            proprio_t = proprio.float()
+        else:
+            proprio_t = torch.from_numpy(np.array(proprio, dtype=np.float32))
+        
+        result = {
+            'images': images_t,
+            'language': raw_sample.get('language', ''),
+            'actions': torch.from_numpy(actions_np).float(),
+            'action_mask': action_mask_t,
+            'embodiment_id': int(raw_sample.get('embodiment_id', 0)),
+            'task_id': int(raw_sample.get('task_id', 0)),
+            'dataset_name': dataset_name,
+            'sample_id': idx,
+            'proprio': proprio_t,
+            'num_views': int(raw_sample.get('num_views', images_t.shape[0])),
+            'num_frames': int(raw_sample.get('num_frames', 1)),
+        }
+        
+        # Pass through VLM ViT encoder inputs (from DataLoader worker preprocessing)
+        for vlm_key in ('vlm_input_ids', 'vlm_attention_mask', 'vlm_pixel_values', 'vlm_image_grid_thw'):
+            if vlm_key in raw_sample:
+                result[vlm_key] = raw_sample[vlm_key]
+        
+        # VLM features (if available)
+        if dataset_name in self.vlm_h5_files:
+            h5 = self.vlm_h5_files[dataset_name]
+            key = f'sample_{idx}'
+            if key in h5:
+                result['vlm_features'] = torch.from_numpy(h5[key]['hidden'][:]).float()
+                result['vlm_pooled'] = torch.from_numpy(h5[key]['pooled'][:]).float()
+        
+        return result
+    
+    def _getitem_legacy(self, raw_sample: dict, dataset_name: str, idx: int) -> dict:
+        """Handle legacy dataset samples (need map_to_unified conversion)."""
         # Get embodiment info with exact native dim for tight masking
         from drifting_vla.data.action_mapping import DATASET_NATIVE_ACTION_DIM
         embodiment_id = DATASET_EMBODIMENT.get(dataset_name, 0)
@@ -265,6 +362,11 @@ class UnifiedDataset(Dataset):
             result['vlm_features'] = vlm_features
             result['vlm_pooled'] = vlm_pooled
 
+        # Pass through VLM ViT encoder inputs (from DataLoader worker preprocessing)
+        for vlm_key in ('vlm_input_ids', 'vlm_attention_mask', 'vlm_pixel_values', 'vlm_image_grid_thw'):
+            if vlm_key in raw_sample:
+                result[vlm_key] = raw_sample[vlm_key]
+
         return result
     
     def get_action_stats(self, dataset_name: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -321,8 +423,8 @@ def create_weighted_sampler(
                       for name, count in ds_counts.items()}
     
     # Assign per-sample weights
-    sample_weights = np.zeros(len(unified_dataset), dtype=np.float64)
-    for i, (ds_name, _) in enumerate(unified_dataset.global_index):
+        sample_weights = np.zeros(len(unified_dataset), dtype=np.float64)
+        for i, (ds_name, _) in enumerate(unified_dataset.global_index):
         # Weight for this sample = dataset_weight / dataset_size
         # so all samples within a dataset have equal probability
         sample_weights[i] = ds_weights.get(ds_name, 1.0) / ds_counts[ds_name]
@@ -344,7 +446,11 @@ def collate_unified(batch: List[dict]) -> dict:
     """
     Custom collate function for UnifiedDataset.
     
-    Handles variable-length VLM features by padding.
+    Handles:
+      - Variable-length images (different camera counts) by padding
+      - VLM ViT encoder inputs (pixel_values, image_grid_thw) by concatenation
+      - Text inputs (input_ids, attention_mask) by padding
+      - Pre-computed VLM features by padding
     """
     result = {}
     
@@ -367,18 +473,43 @@ def collate_unified(batch: List[dict]) -> dict:
     result['dataset_name'] = [s['dataset_name'] for s in batch]
     result['sample_id'] = torch.tensor([s['sample_id'] for s in batch], dtype=torch.long)
 
-    # Proprioception (padded to 128-dim in dataset, just stack)
+    # Proprioception
     if 'proprio' in batch[0]:
         result['proprio'] = torch.stack([s['proprio'] for s in batch])
 
-    # Camera/time metadata (take max from batch)
+    # Camera/time metadata
     result['num_views'] = max(s.get('num_views', 1) for s in batch)
     result['num_frames'] = max(s.get('num_frames', 1) for s in batch)
     
-    # Pad VLM features if present in ANY sample
+    # ── VLM ViT encoder inputs (vision-encoder-only, from DataLoader workers) ──
+    has_vlm_tokens = 'vlm_input_ids' in batch[0]
+    if has_vlm_tokens:
+        from torch.nn.utils.rnn import pad_sequence
+
+        # Text: pad input_ids and attention_mask to max length
+        result['vlm_input_ids'] = pad_sequence(
+            [s['vlm_input_ids'] for s in batch],
+            batch_first=True, padding_value=0,
+        )
+        result['vlm_attention_mask'] = pad_sequence(
+            [s['vlm_attention_mask'] for s in batch],
+            batch_first=True, padding_value=0,
+        )
+
+        # pixel_values: [N_patches, C_patch] per sample — concatenate all
+        # The ViT encoder processes ALL patches from ALL samples in one call
+        pv_list = [s['vlm_pixel_values'] for s in batch if 'vlm_pixel_values' in s]
+        if pv_list:
+            result['vlm_pixel_values'] = torch.cat(pv_list, dim=0)  # [N_total_patches, C]
+
+        # image_grid_thw: [N_images, 3] per sample — concatenate all
+        if 'vlm_image_grid_thw' in batch[0]:
+            thw_list = [s['vlm_image_grid_thw'] for s in batch]
+            result['vlm_image_grid_thw'] = torch.cat(thw_list, dim=0)  # [N_total_images, 3]
+
+    # ── Pre-computed VLM features (offline path) ──
     has_vlm = any('vlm_features' in s and s.get('vlm_features') is not None for s in batch)
-    if has_vlm:
-        # Find max length and dim from available features
+    if has_vlm and not has_vlm_tokens:
         available = [s for s in batch if 'vlm_features' in s and s['vlm_features'] is not None]
         max_len = max(s['vlm_features'].shape[0] for s in available)
         dim = available[0]['vlm_features'].shape[1]
@@ -394,7 +525,6 @@ def collate_unified(batch: List[dict]) -> dict:
                 vlm_attn_mask[i, :L] = True
                 vlm_pooled_list.append(s['vlm_pooled'])
             else:
-                # No VLM features — fill with zeros (will be handled in trainer)
                 vlm_pooled_list.append(torch.zeros(dim))
         
         result['vlm_features'] = padded_features

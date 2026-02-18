@@ -220,3 +220,6 @@ outputs/
 
 # SLURM
 interactive.sh
+
+# Test script
+test.sh

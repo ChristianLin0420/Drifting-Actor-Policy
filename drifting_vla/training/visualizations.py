@@ -4,17 +4,23 @@ WandB Visualization Suite for Drifting-VLA
 
 Publication-quality viz panels with rich annotations and statistics.
 
-Panels:
+Panels (Training):
   viz/A1_drifting_field        — Drift vectors on actual pred→GT space
   viz/A2_drift_magnitude_trend — λ_V convergence with EMA smoothing
-  viz/A3_prediction_scatter    — Pred vs GT with R², regression line, error stats
-  viz/A4_per_dim_error_radar   — Per-dim MAE bar chart with region labels
+  viz/A3_prediction_scatter    — Pred vs GT ALL dims, ALL timesteps (dense scatter)
+  viz/A4_per_dim_error_bar     — ALL active dims (0-55) error bar chart
   viz/A5_temperature_loss      — Temperature loss with trend comparison
-  viz/B1_action_distribution   — KDE overlays with KL divergence
-  viz/B2_action_error_heatmap  — Timestep×Dim error with region annotations
-  viz/B4_trajectory_3d         — Action trajectories with error shading
-  viz/C1_sample_transport      — Before/after drift with magnitude colormap
+  viz/B1_action_distribution   — ALL active dims violin/histogram grid
+  viz/B2_action_error_heatmap  — ALL active dims × Timestep heatmap
+  viz/B3_per_region_summary    — Per-region aggregated error radar
+  viz/B4_trajectory_2d         — Clear 2D multi-panel trajectories (GT vs Pred)
+  viz/B5_temporal_error_curve  — Error evolution across action horizon
+  viz/C1_sample_transport      — PCA-projected transport with magnitude colormap
   viz/C2_mode_coverage         — Coverage + correlation matrix
+  viz/C3_action_smoothness     — Frequency spectrum / jerk analysis
+
+Panels (Evaluation):
+  viz/D1_eval_dashboard        — Per-dataset eval bar charts
 """
 
 import torch
@@ -29,7 +35,9 @@ try:
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
-    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
     HAS_MPL = True
 except ImportError:
     HAS_MPL = False
@@ -44,30 +52,33 @@ COLORS = {
     'grid': '#7f8c8d',     # Mid gray
     'text': '#ecf0f1',     # Light
 }
-REGION_NAMES = {
-    (0, 8): 'EEF Pose',
-    (8, 16): 'Joint Pos',
-    (16, 32): 'Bimanual',
-    (32, 48): 'Dex Hand',
-    (48, 56): 'Base/Extra',
-}
+
+REGION_DEFS = [
+    (0, 8,   'EEF',      '#3498db'),
+    (8, 16,  'Joint',    '#9b59b6'),
+    (16, 32, 'Bimanual', '#2ecc71'),
+    (32, 48, 'DexHand',  '#e74c3c'),
+    (48, 56, 'Base',     '#f39c12'),
+]
+
+REGION_NAMES = {(s, e): n for s, e, n, _ in REGION_DEFS}
 
 
 def _setup_style():
     """Apply consistent high-readability plot style for WandB panels."""
     plt.rcParams.update({
-        'font.size': 13,
-        'axes.titlesize': 15,
-        'axes.labelsize': 13,
-        'xtick.labelsize': 11,
-        'ytick.labelsize': 11,
-        'legend.fontsize': 11,
+        'font.size': 11,
+        'axes.titlesize': 13,
+        'axes.labelsize': 11,
+        'xtick.labelsize': 9,
+        'ytick.labelsize': 9,
+        'legend.fontsize': 9,
         'figure.facecolor': 'white',
         'axes.facecolor': '#f8f9fa',
         'axes.grid': True,
         'grid.alpha': 0.3,
         'grid.linestyle': '--',
-        'figure.dpi': 100,
+        'figure.dpi': 120,
     })
 
 
@@ -97,12 +108,34 @@ def _get_active_dims_info(mask):
     return active, labels
 
 
+def _dim_color(d):
+    """Get color for a given dimension index based on region."""
+    for start, end, _, color in REGION_DEFS:
+        if start <= d < end:
+            return color
+    return '#95a5a6'
+
+
+def _dim_label_short(d):
+    """Short label like 'E0' for EEF[0], 'J3' for Joint[11], etc."""
+    for start, end, name, _ in REGION_DEFS:
+        if start <= d < end:
+            return f'{name[0]}{d - start}'
+    return f'P{d}'
+
+
 def _ema_smooth(values, alpha=0.1):
     """Exponential moving average for trend smoothing."""
     smoothed = [values[0]]
     for v in values[1:]:
         smoothed.append(alpha * v + (1 - alpha) * smoothed[-1])
     return smoothed
+
+
+def _region_legend():
+    """Create shared region legend elements."""
+    return [Patch(facecolor=c, label=f'{n} [{s}:{e}]')
+            for s, e, n, c in REGION_DEFS]
 
 
 class VizLogger:
@@ -114,6 +147,15 @@ class VizLogger:
         self._step_history = []
         self._mse_history = []
         self._loss_history = []
+        # For D2: training curve history
+        self._train_loss_steps = []
+        self._train_loss_vals = []
+        self._train_mse_vals = []
+        self._train_drift_vals = []
+        # For D3: per-dataset eval history
+        self._eval_history = {}  # {ds_name: {'steps': [], 'mse': [], 'mae': [], 'corr': []}}
+        # For D4: data balance tracking
+        self._dataset_batch_counts = {}  # {ds_name: count}
 
     def log_training_viz(
         self,
@@ -141,47 +183,78 @@ class VizLogger:
         mask = action_mask.detach().cpu().float().numpy()
         B, T, D = pred.shape
 
-        active = mask[0] > 0.5 if mask.ndim == 2 else np.ones(D, dtype=bool)
-        active_dims, dim_labels = _get_active_dims_info(mask[0] if mask.ndim == 2 else np.ones(D))
+        # Collect ALL active dims across the batch (union of masks)
+        if mask.ndim == 2:
+            union_mask = (mask.max(axis=0) > 0.5)
+        else:
+            union_mask = np.ones(D, dtype=bool)
+        active_dims = np.where(union_mask)[0]
+        dim_labels = [f'{_dim_label_short(d)}' for d in active_dims]
         n_active = len(active_dims)
 
         log_dict = {}
 
-        try:
-            if drift_field is not None and step % 500 == 0:
-                log_dict['viz/A1_drifting_field'] = self._plot_A1(
-                    pred, gt, drift_field.detach().cpu().float().numpy(), active_dims, step)
+        # Each panel is independently try/excepted
+        panels = []
 
-            if len(self.drift_history) >= 2 and step % 200 == 0:
-                log_dict['viz/A2_drift_magnitude_trend'] = self._plot_A2(step)
+        if drift_field is not None and step % 500 == 0:
+            panels.append(('viz/A1_drifting_field', lambda: self._plot_A1(
+                pred, gt, drift_field.detach().cpu().float().numpy(), active_dims, step)))
 
-            if step % 500 == 0:
-                log_dict['viz/A3_prediction_scatter'] = self._plot_A3(pred, gt, active_dims, dim_labels, step)
+        if len(self.drift_history) >= 2 and step % 200 == 0:
+            panels.append(('viz/A2_drift_magnitude_trend', lambda: self._plot_A2(step)))
 
-            if step % 500 == 0 and n_active >= 3:
-                log_dict['viz/A4_per_dim_error_radar'] = self._plot_A4(pred, gt, active_dims, dim_labels, step)
+        if step % 500 == 0:
+            panels.append(('viz/A3_prediction_scatter', lambda: self._plot_A3(
+                pred, gt, active_dims, dim_labels, step)))
 
-            if per_temp_losses and step % 500 == 0:
-                log_dict['viz/A5_temperature_loss'] = self._plot_A5(per_temp_losses, step)
+        if step % 500 == 0 and n_active >= 1:
+            panels.append(('viz/A4_per_dim_error_bar', lambda: self._plot_A4(
+                pred, gt, active_dims, dim_labels, step)))
 
-            if step % 500 == 0:
-                log_dict['viz/B1_action_distribution'] = self._plot_B1(pred, gt, active_dims, dim_labels, step)
+        if per_temp_losses and step % 500 == 0:
+            panels.append(('viz/A5_temperature_loss', lambda: self._plot_A5(
+                per_temp_losses, step)))
 
-            if step % 500 == 0:
-                log_dict['viz/B2_action_error_heatmap'] = self._plot_B2(pred, gt, active_dims, dim_labels, step)
+        if step % 500 == 0:
+            panels.append(('viz/B1_action_distribution', lambda: self._plot_B1(
+                pred, gt, active_dims, dim_labels, step)))
 
-            if step % 1000 == 0 and n_active >= 3:
-                log_dict['viz/B4_trajectory_3d'] = self._plot_B4(pred, gt, active_dims, step)
+        if step % 500 == 0:
+            panels.append(('viz/B2_action_error_heatmap', lambda: self._plot_B2(
+                pred, gt, active_dims, dim_labels, step)))
 
-            if drift_field is not None and step % 500 == 0:
-                log_dict['viz/C1_sample_transport'] = self._plot_C1(
-                    pred, gt, drift_field.detach().cpu().float().numpy(), active_dims, step)
+        if step % 1000 == 0 and n_active >= 1:
+            panels.append(('viz/B3_per_region_summary', lambda: self._plot_B3(
+                pred, gt, active_dims, step)))
 
-            if step % 2000 == 0:
-                log_dict['viz/C2_mode_coverage'] = self._plot_C2(pred, gt, active_dims, dim_labels, step)
+        if step % 1000 == 0 and n_active >= 2 and B >= 2:
+            panels.append(('viz/B4_trajectory_2d', lambda: self._plot_B4(
+                pred, gt, active_dims, step)))
 
-        except Exception as e:
-            logger.warning(f"Viz error at step {step}: {e}")
+        if step % 500 == 0 and T >= 2:
+            panels.append(('viz/B5_temporal_error_curve', lambda: self._plot_B5(
+                pred, gt, active_dims, dim_labels, step)))
+
+        if drift_field is not None and step % 500 == 0 and B >= 2:
+            panels.append(('viz/C1_sample_transport', lambda: self._plot_C1(
+                pred, gt, drift_field.detach().cpu().float().numpy(), active_dims, step)))
+
+        if step % 2000 == 0 and B >= 4:
+            panels.append(('viz/C2_mode_coverage', lambda: self._plot_C2(
+                pred, gt, active_dims, dim_labels, step)))
+
+        if step % 1000 == 0 and T >= 4:
+            panels.append(('viz/C3_action_smoothness', lambda: self._plot_C3(
+                pred, gt, active_dims, step)))
+
+        for panel_key, panel_fn in panels:
+            try:
+                result = panel_fn()
+                if result is not None:
+                    log_dict[panel_key] = result
+            except Exception as e:
+                logger.warning(f"Viz {panel_key} error at step {step}: {e}")
 
         if log_dict:
             wandb.log(log_dict, step=step)
@@ -192,23 +265,25 @@ class VizLogger:
     def _plot_A1(self, pred, gt, drift_field, active_dims, step):
         B, T, D = pred.shape
         d0, d1 = active_dims[0], active_dims[min(1, len(active_dims)-1)]
-        n = min(B, 60)
+
+        # drift_field is [N_emb, T*D] (per-embodiment subset, flattened)
+        # Clip n to the smaller of batch size and drift_field rows
+        n_drift = drift_field.shape[0]
+        n = min(B, n_drift, 60)
+        if n < 2:
+            return None
 
         fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 
-        # Left: drift vectors — use pred positions and compute drift from flattened field
         ax = axes[0]
         x = pred[:n, 0, d0]
         y = pred[:n, 0, d1]
-        
-        # drift_field is [B, T*D] — extract d0, d1 from first timestep
+
+        # drift_field is flattened [N, T*D]; extract dim d0 at timestep 0
         flat_D = drift_field.shape[1]
-        stride = flat_D // T if T > 0 else D
         dx = drift_field[:n, d0] if d0 < flat_D else np.zeros(n)
         dy = drift_field[:n, d1] if d1 < flat_D else np.zeros(n)
         mag = np.sqrt(dx**2 + dy**2 + 1e-12)
-
-        # Scale arrows for visibility
         max_mag = mag.max() + 1e-8
         scale_factor = 0.3 * (np.abs(x).max() + np.abs(y).max() + 0.01) / max_mag
 
@@ -220,28 +295,27 @@ class VizLogger:
                         xytext=(x[i], y[i]),
                         arrowprops=dict(arrowstyle='->', color=plt.cm.coolwarm(mag[i]/max_mag),
                                        lw=1.5, alpha=0.7))
-        ax.set_xlabel(f'Action Dim {d0}', fontsize=13)
-        ax.set_ylabel(f'Action Dim {d1}', fontsize=13)
-        ax.set_title('Drift Vectors (pred → pred+V)', fontsize=14)
-        ax.legend(fontsize=12)
+        ax.set_xlabel(f'Dim {d0} ({_dim_label_short(d0)})')
+        ax.set_ylabel(f'Dim {d1} ({_dim_label_short(d1)})')
+        ax.set_title(f'Drift Vectors (pred → pred+V) | {n} samples')
+        ax.legend()
 
-        # Right: drift magnitude histogram
         ax = axes[1]
         all_mag = np.linalg.norm(drift_field[:n], axis=1)
-        ax.hist(all_mag, bins=25, color=COLORS['gt'], alpha=0.8, edgecolor='white', linewidth=0.5)
+        ax.hist(all_mag, bins=25, color=COLORS['gt'], alpha=0.8, edgecolor='white')
         ax.axvline(all_mag.mean(), color=COLORS['pred'], linestyle='--', linewidth=2.5,
                    label=f'Mean |V| = {all_mag.mean():.4f}')
-        ax.set_xlabel('Drift Magnitude |V|', fontsize=13)
-        ax.set_ylabel('Count', fontsize=13)
-        ax.set_title('Drift Magnitude Distribution', fontsize=14)
-        ax.legend(fontsize=12)
+        ax.set_xlabel('Drift Magnitude |V|')
+        ax.set_ylabel('Count')
+        ax.set_title('Drift Magnitude Distribution')
+        ax.legend()
 
-        fig.suptitle(f'A1: Drifting Field — Step {step}', fontsize=16, fontweight='bold')
+        fig.suptitle(f'A1: Drifting Field — Step {step}', fontsize=14, fontweight='bold')
         plt.tight_layout()
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # A2: Drift Trend — λ_V with EMA smoothing + annotations
+    # A2: Drift Trend — λ_V with EMA smoothing
     # ──────────────────────────────────────────────────────────────
     def _plot_A2(self, step):
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -254,7 +328,6 @@ class VizLogger:
         ax.plot(steps, smoothed, color=COLORS['pred'], linewidth=2.5, label='EMA (α=0.15)')
         ax.fill_between(steps, smoothed, alpha=0.08, color=COLORS['pred'])
 
-        # Annotations
         ax.annotate(f'Latest: {vals[-1]:.4f}', xy=(steps[-1], vals[-1]),
                     fontsize=10, fontweight='bold', color=COLORS['pred'],
                     ha='right', va='bottom')
@@ -269,7 +342,7 @@ class VizLogger:
 
         ax.set_xlabel('Training Step')
         ax.set_ylabel('λ_V (drift magnitude)')
-        ax.set_title('A2: Drift Magnitude Trend — Should ↓ toward 0 as model converges', fontsize=12)
+        ax.set_title('A2: Drift Magnitude Trend — Should ↓ toward 0', fontsize=12)
         ax.legend(loc='upper right')
 
         if len(vals) > 5 and vals.max() > 10 * (vals.min() + 1e-8):
@@ -279,124 +352,137 @@ class VizLogger:
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # A3: Prediction Scatter — with R², MAE, regression line
+    # A3: Prediction Scatter — ALL dims, ALL timesteps for dense dots
     # ──────────────────────────────────────────────────────────────
     def _plot_A3(self, pred, gt, active_dims, dim_labels, step):
+        """Dense scatter: pool ALL batch samples × ALL timesteps for each dim."""
         B, T, D = pred.shape
-        n_show = min(6, len(active_dims))
-        ncols = 3
+        n_active = len(active_dims)
+        n_show = min(n_active, 12)
+
+        if n_active <= n_show:
+            show_indices = list(range(n_active))
+        else:
+            show_indices = np.linspace(0, n_active - 1, n_show, dtype=int).tolist()
+
+        ncols = min(4, n_show)
         nrows = (n_show + ncols - 1) // ncols
 
-        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5.5 * nrows))
-        if nrows == 1: axes = axes[np.newaxis, :]
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows))
+        if nrows == 1 and ncols == 1:
+            axes = np.array([[axes]])
+        elif nrows == 1:
+            axes = axes[np.newaxis, :]
+        elif ncols == 1:
+            axes = axes[:, np.newaxis]
         axes_flat = axes.flatten()
 
-        overall_mae = 0
-        for i in range(n_show):
-            d = active_dims[i]
-            ax = axes_flat[i]
-            p = pred[:, 0, d]
-            g = gt[:, 0, d]
+        overall_r2 = []
+        for plot_i, dim_i in enumerate(show_indices):
+            d = active_dims[dim_i]
+            ax = axes_flat[plot_i]
 
-            # Scatter with density coloring
-            ax.scatter(g, p, s=12, alpha=0.6, c=COLORS['gt'], edgecolors='none')
+            p = pred[:, :, d].flatten()
+            g = gt[:, :, d].flatten()
 
-            # Perfect prediction line
-            lim = max(abs(g).max(), abs(p).max(), 0.01) * 1.15
-            ax.plot([-lim, lim], [-lim, lim], '--', color=COLORS['accent'], linewidth=1.5, alpha=0.7, label='y=x')
+            max_pts = 3000
+            if len(p) > max_pts:
+                idx = np.random.choice(len(p), max_pts, replace=False)
+                p_plot, g_plot = p[idx], g[idx]
+            else:
+                p_plot, g_plot = p, g
 
-            # Regression line
-            if len(g) > 2 and np.std(g) > 1e-8:
+            ax.scatter(g_plot, p_plot, s=8, alpha=0.4, c=_dim_color(d), edgecolors='none')
+
+            lim = max(np.abs(g).max(), np.abs(p).max(), 0.01) * 1.15
+            ax.plot([-lim, lim], [-lim, lim], '--', color='gray', linewidth=1, alpha=0.6)
+
+            if np.std(g) > 1e-8:
                 coeffs = np.polyfit(g, p, 1)
                 x_fit = np.linspace(-lim, lim, 100)
                 ax.plot(x_fit, np.polyval(coeffs, x_fit), '-', color=COLORS['pred'],
-                        linewidth=1.5, alpha=0.7, label=f'fit: {coeffs[0]:.2f}x+{coeffs[1]:.2f}')
+                        linewidth=1.5, alpha=0.7)
 
-            # Stats
             mae = np.abs(p - g).mean()
-            overall_mae += mae
             corr = np.corrcoef(g, p)[0, 1] if np.std(g) > 1e-8 and np.std(p) > 1e-8 else 0
             ss_res = np.sum((p - g) ** 2)
             ss_tot = np.sum((g - g.mean()) ** 2) + 1e-8
             r2 = max(0, 1 - ss_res / ss_tot)
+            overall_r2.append(r2)
 
-            stats_text = f'R²={r2:.3f}\nMAE={mae:.3f}\nr={corr:.3f}'
-            ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, fontsize=8,
-                    va='top', fontfamily='monospace',
+            ax.text(0.04, 0.96, f'R²={r2:.3f}\nMAE={mae:.3f}\nr={corr:.3f}\nN={len(p)}',
+                    transform=ax.transAxes, fontsize=7, va='top', fontfamily='monospace',
                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.85))
 
             ax.set_xlim(-lim, lim)
             ax.set_ylim(-lim, lim)
             ax.set_aspect('equal')
-            ax.set_title(dim_labels[i] if i < len(dim_labels) else f'Dim {d}', fontsize=9)
-            ax.set_xlabel('Ground Truth', fontsize=8)
-            ax.set_ylabel('Prediction', fontsize=8)
+            ax.set_title(f'{dim_labels[dim_i]} (d{d})', fontsize=9, fontweight='bold',
+                         color=_dim_color(d))
+            ax.set_xlabel('GT', fontsize=8)
+            ax.set_ylabel('Pred', fontsize=8)
 
-        for i in range(n_show, len(axes_flat)):
+        for i in range(len(show_indices), len(axes_flat)):
             axes_flat[i].axis('off')
 
-        overall_mae /= max(n_show, 1)
-        fig.suptitle(f'A3: Prediction vs GT — Step {step} | Overall MAE: {overall_mae:.4f}',
-                     fontsize=13, fontweight='bold')
+        avg_r2 = np.mean(overall_r2) if overall_r2 else 0
+        fig.suptitle(f'A3: Pred vs GT (all timesteps pooled, {B*T} pts/dim) — '
+                     f'Step {step} | Mean R²={avg_r2:.3f}',
+                     fontsize=12, fontweight='bold')
         plt.tight_layout()
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # A4: Per-Dim Error — horizontal bar chart with region colors
+    # A4: Per-Dim Error — ALL active dims, full bar chart 0-55
     # ──────────────────────────────────────────────────────────────
     def _plot_A4(self, pred, gt, active_dims, dim_labels, step):
+        """Show MAE for EVERY active dimension — no truncation."""
         B, T, D = pred.shape
-        mae = np.abs(pred[:, 0, :] - gt[:, 0, :]).mean(axis=0)
-        n = min(len(active_dims), 24)
-        dims = active_dims[:n]
-        vals = mae[dims]
+        mae_all = np.abs(pred - gt).mean(axis=(0, 1))  # [D]
+        n = len(active_dims)
+        vals = mae_all[active_dims]
 
-        fig, ax = plt.subplots(figsize=(10, max(4, n * 0.3)))
+        fig_h = max(5, n * 0.28)
+        fig, ax = plt.subplots(figsize=(12, fig_h))
 
-        # Color by region
-        colors = []
-        for d in dims:
-            if d < 8: colors.append('#3498db')      # EEF
-            elif d < 16: colors.append('#9b59b6')    # Joint
-            elif d < 32: colors.append('#2ecc71')    # Bimanual
-            elif d < 48: colors.append('#e74c3c')    # Dex hand
-            elif d < 56: colors.append('#f39c12')    # Extra
-            else: colors.append('#95a5a6')           # Pad
+        colors = [_dim_color(d) for d in active_dims]
+        y_pos = np.arange(n)
 
-        bars = ax.barh(range(n), vals, color=colors, alpha=0.85, edgecolor='white', height=0.7)
-        ax.set_yticks(range(n))
-        ax.set_yticklabels([dim_labels[i] if i < len(dim_labels) else f'd{d}' for i, d in enumerate(dims)],
-                           fontsize=8, fontfamily='monospace')
+        bars = ax.barh(y_pos, vals, color=colors, alpha=0.85, edgecolor='white', height=0.72)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([f'd{d:2d} {dim_labels[i]}' for i, d in enumerate(active_dims)],
+                           fontsize=7, fontfamily='monospace')
 
-        # Value labels
+        max_v = vals.max() if len(vals) > 0 else 1
         for bar, v in zip(bars, vals):
-            ax.text(bar.get_width() + vals.max() * 0.02, bar.get_y() + bar.get_height() / 2,
-                    f'{v:.4f}', va='center', fontsize=7, fontfamily='monospace')
+            ax.text(bar.get_width() + max_v * 0.015, bar.get_y() + bar.get_height() / 2,
+                    f'{v:.4f}', va='center', fontsize=6, fontfamily='monospace')
 
-        # Mean line
         ax.axvline(vals.mean(), color='black', linestyle='--', linewidth=1.5, alpha=0.5,
-                   label=f'Mean MAE = {vals.mean():.4f}')
+                   label=f'Mean = {vals.mean():.4f}')
+        ax.axvline(np.median(vals), color=COLORS['accent'], linestyle=':', linewidth=1.5, alpha=0.5,
+                   label=f'Median = {np.median(vals):.4f}')
 
-        # Legend for regions
-        from matplotlib.patches import Patch
-        legend_elements = [
-            Patch(facecolor='#3498db', label='EEF [0:8]'),
-            Patch(facecolor='#9b59b6', label='Joint [8:16]'),
-            Patch(facecolor='#2ecc71', label='Bimanual [16:32]'),
-            Patch(facecolor='#e74c3c', label='Dex Hand [32:48]'),
-            Patch(facecolor='#f39c12', label='Base [48:56]'),
-        ]
-        ax.legend(handles=legend_elements, loc='lower right', fontsize=7, ncol=2)
+        for start, end, name, color in REGION_DEFS:
+            in_region = [i for i, d in enumerate(active_dims) if start <= d < end]
+            if in_region:
+                mid = (in_region[0] + in_region[-1]) / 2
+                ax.text(max_v * 1.12, mid, name, fontsize=8, fontweight='bold',
+                        color=color, va='center', ha='left')
 
-        ax.set_xlabel('Mean Absolute Error')
-        ax.set_title(f'A4: Per-Dimension Error — Step {step} | Worst: {dim_labels[np.argmax(vals)]} ({vals.max():.4f})',
-                     fontsize=12, fontweight='bold')
+        ax.legend(loc='lower right', fontsize=8)
+        ax.set_xlabel('Mean Absolute Error (all timesteps)', fontsize=10)
+        worst_i = np.argmax(vals)
+        ax.set_title(f'A4: Per-Dimension Error (all {n} active dims) — Step {step}\n'
+                     f'Worst: d{active_dims[worst_i]} {dim_labels[worst_i]} = {vals[worst_i]:.4f}',
+                     fontsize=11, fontweight='bold')
         ax.invert_yaxis()
+        ax.set_xlim(0, max_v * 1.25)
         plt.tight_layout()
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # A5: Temperature Loss — grouped bars with annotations
+    # A5: Temperature Loss
     # ──────────────────────────────────────────────────────────────
     def _plot_A5(self, per_temp_losses, step):
         fig, ax = plt.subplots(figsize=(8, 5))
@@ -408,19 +494,18 @@ class VizLogger:
         bars = ax.bar(range(len(taus)), vals, color=colors, edgecolor='white',
                       linewidth=1.5, width=0.6, alpha=0.9)
 
-        for bar, v, tau in zip(bars, vals, taus):
+        for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.02,
                     f'{v:.5f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
 
         ax.set_xticks(range(len(taus)))
         ax.set_xticklabels([f'τ = {t}' for t in taus], fontsize=11)
-        ax.set_ylabel('Raw Drift Norm (before normalization)', fontsize=10)
+        ax.set_ylabel('Raw Drift Norm')
 
-        # Interpretation text
         if len(vals) >= 2:
             ratio = vals[0] / (vals[-1] + 1e-8)
-            interp = 'Fine detail learned' if ratio < 0.5 else 'Still learning coarse structure' if ratio > 2 else 'Balanced'
-            ax.text(0.5, 0.95, f'Low-τ / High-τ ratio: {ratio:.2f} — {interp}',
+            interp = 'Fine detail learned' if ratio < 0.5 else 'Still learning coarse' if ratio > 2 else 'Balanced'
+            ax.text(0.5, 0.95, f'Low-τ / High-τ = {ratio:.2f} — {interp}',
                     transform=ax.transAxes, fontsize=10, ha='center', va='top',
                     bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
 
@@ -429,235 +514,505 @@ class VizLogger:
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # B1: Action Distribution — KDE overlays with overlap stats
+    # B1: Action Distribution — ALL active dims in compact grid
     # ──────────────────────────────────────────────────────────────
     def _plot_B1(self, pred, gt, active_dims, dim_labels, step):
+        """Compact distribution view: ALL active dims as mini histograms in a grid."""
         B, T, D = pred.shape
-        n_show = min(6, len(active_dims))
-        ncols = 3
-        nrows = (n_show + ncols - 1) // ncols
+        n = len(active_dims)
+        if n == 0:
+            return fig_to_wandb_image(plt.figure())
 
-        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows))
-        if nrows == 1: axes = axes[np.newaxis, :]
+        ncols = min(8, n)
+        nrows = (n + ncols - 1) // ncols
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(2.2 * ncols, 1.8 * nrows))
+        if nrows == 1 and ncols == 1:
+            axes = np.array([[axes]])
+        elif nrows == 1:
+            axes = axes[np.newaxis, :]
+        elif ncols == 1:
+            axes = axes[:, np.newaxis]
         axes_flat = axes.flatten()
 
-        for i in range(n_show):
+        for i in range(n):
             d = active_dims[i]
             ax = axes_flat[i]
-            g = gt[:, 0, d]
-            p = pred[:, 0, d]
 
-            # Histograms with KDE-like smoothing
-            bins = np.linspace(min(g.min(), p.min()) - 0.1, max(g.max(), p.max()) + 0.1, 30)
-            ax.hist(g, bins=bins, alpha=0.5, color=COLORS['gt'], density=True, label='GT', edgecolor='white')
-            ax.hist(p, bins=bins, alpha=0.5, color=COLORS['pred'], density=True, label='Pred', edgecolor='white')
+            g = gt[:, :, d].flatten()
+            p = pred[:, :, d].flatten()
 
-            # Stats
-            gt_std = np.std(g)
+            lo = min(g.min(), p.min())
+            hi = max(g.max(), p.max())
+            margin = (hi - lo) * 0.1 + 0.01
+            bins = np.linspace(lo - margin, hi + margin, 25)
+
+            ax.hist(g, bins=bins, alpha=0.55, color=COLORS['gt'], density=True, edgecolor='none')
+            ax.hist(p, bins=bins, alpha=0.55, color=COLORS['pred'], density=True, edgecolor='none')
+
+            gt_std = np.std(g) + 1e-8
             pred_std = np.std(p)
-            coverage = pred_std / (gt_std + 1e-8) * 100
+            cov = pred_std / gt_std * 100
 
-            stats = f'μ_GT={g.mean():.2f} σ={gt_std:.2f}\nμ_P={p.mean():.2f} σ={pred_std:.2f}\nCov={coverage:.0f}%'
-            ax.text(0.97, 0.95, stats, transform=ax.transAxes, fontsize=7, va='top', ha='right',
-                    fontfamily='monospace', bbox=dict(boxstyle='round', facecolor='white', alpha=0.85))
+            ax.set_title(f'd{d} {dim_labels[i]}', fontsize=7, fontweight='bold',
+                         color=_dim_color(d), pad=2)
+            ax.tick_params(labelsize=5, length=2)
+            ax.set_yticks([])
 
-            ax.set_title(dim_labels[i] if i < len(dim_labels) else f'Dim {d}', fontsize=9)
-            if i == 0:
-                ax.legend(fontsize=8)
+            ax.text(0.97, 0.95, f'{cov:.0f}%', transform=ax.transAxes, fontsize=6,
+                    ha='right', va='top', color=COLORS['accent'] if cov > 60 else COLORS['pred'],
+                    fontweight='bold')
 
-        for i in range(n_show, len(axes_flat)):
+        for i in range(n, len(axes_flat)):
             axes_flat[i].axis('off')
 
-        fig.suptitle(f'B1: Action Distribution Overlap — Step {step}', fontsize=13, fontweight='bold')
+        fig.legend([Patch(color=COLORS['gt'], alpha=0.55), Patch(color=COLORS['pred'], alpha=0.55)],
+                   ['Ground Truth', 'Prediction'], loc='upper right', fontsize=8, ncol=2,
+                   framealpha=0.9)
+
+        fig.suptitle(f'B1: Action Distribution — ALL {n} dims — Step {step}\n'
+                     f'(% = pred coverage of GT range)',
+                     fontsize=11, fontweight='bold', y=1.02)
         plt.tight_layout()
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # B2: Error Heatmap — with region annotations and temporal stats
+    # B2: Error Heatmap — ALL active dims × ALL timesteps
     # ──────────────────────────────────────────────────────────────
     def _plot_B2(self, pred, gt, active_dims, dim_labels, step):
+        """Full heatmap: ALL active dims on y-axis, timesteps on x-axis."""
         B, T, D = pred.shape
         error = np.abs(pred - gt).mean(axis=0)  # [T, D]
+        n = len(active_dims)
+        error_active = error[:, active_dims]  # [T, n]
 
-        # Only show active dims
-        n = min(len(active_dims), 32)
-        dims = active_dims[:n]
-        error_active = error[:, dims]  # [T, n_active]
+        fig_h = max(5, n * 0.22)
+        fig, axes = plt.subplots(1, 2, figsize=(16, fig_h),
+                                 gridspec_kw={'width_ratios': [3, 1]})
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5), gridspec_kw={'width_ratios': [3, 1]})
-
-        # Left: heatmap
         ax = axes[0]
-        im = ax.imshow(error_active.T, aspect='auto', cmap='YlOrRd', interpolation='bilinear')
+        im = ax.imshow(error_active.T, aspect='auto', cmap='YlOrRd',
+                       interpolation='nearest', origin='upper')
         ax.set_xlabel('Timestep t', fontsize=10)
         ax.set_ylabel('Action Dimension', fontsize=10)
         ax.set_yticks(range(n))
-        ax.set_yticklabels([dim_labels[i][:12] if i < len(dim_labels) else f'd{d}'
-                            for i, d in enumerate(dims)], fontsize=7, fontfamily='monospace')
-        plt.colorbar(im, ax=ax, label='MAE', shrink=0.8)
+        ax.set_yticklabels([f'd{d:2d} {dim_labels[i]}' for i, d in enumerate(active_dims)],
+                           fontsize=6, fontfamily='monospace')
 
-        # Right: per-dim average error bar
+        if T <= 16:
+            ax.set_xticks(range(T))
+        else:
+            ax.set_xticks(np.linspace(0, T-1, min(16, T), dtype=int))
+
+        plt.colorbar(im, ax=ax, label='MAE', shrink=0.8, pad=0.02)
+
+        for start, end, name, color in REGION_DEFS:
+            in_region = [i for i, d in enumerate(active_dims) if start <= d < end]
+            if in_region:
+                for idx in in_region:
+                    ax.add_patch(plt.Rectangle((-0.8, idx - 0.4), 0.5, 0.8,
+                                               color=color, alpha=0.6, clip_on=False))
+
         ax2 = axes[1]
-        dim_avg = error_active.mean(axis=0)
-        ax2.barh(range(n), dim_avg, color=[COLORS['pred'] if v > dim_avg.mean() else COLORS['gt']
-                                             for v in dim_avg], alpha=0.8, height=0.7)
+        dim_avg = error_active.mean(axis=0)  # [n]
+
+        bar_colors = [COLORS['pred'] if v > dim_avg.mean() * 1.5
+                      else COLORS['warn'] if v > dim_avg.mean()
+                      else COLORS['gt'] for v in dim_avg]
+        ax2.barh(range(n), dim_avg, color=bar_colors, alpha=0.8, height=0.7)
         ax2.set_yticks([])
-        ax2.set_xlabel('Avg MAE')
-        ax2.set_title('Per-Dim Avg')
-        ax2.axvline(dim_avg.mean(), color='black', linestyle='--', alpha=0.5)
+        ax2.set_xlabel('Avg MAE', fontsize=9)
+        ax2.set_title('Per-Dim\nAvg Error', fontsize=9)
+        ax2.axvline(dim_avg.mean(), color='black', linestyle='--', alpha=0.5, linewidth=1)
         ax2.invert_yaxis()
 
-        # Stats annotation
         temporal_trend = error_active.mean(axis=1)  # [T]
         if len(temporal_trend) > 1:
             increase = (temporal_trend[-1] - temporal_trend[0]) / (temporal_trend[0] + 1e-8) * 100
-            note = f'Error drift: {increase:+.1f}% from t=0→t={T-1}'
+            note = f'Error drift: {increase:+.1f}% from t=0→t={T-1} | Mean MAE={error_active.mean():.4f}'
         else:
             note = f'Mean MAE: {error_active.mean():.4f}'
 
-        fig.suptitle(f'B2: Action Error Heatmap — Step {step} | {note}',
+        fig.suptitle(f'B2: Error Heatmap — ALL {n} dims × {T} timesteps — Step {step}\n{note}',
+                     fontsize=11, fontweight='bold')
+        plt.tight_layout()
+        return fig_to_wandb_image(fig)
+
+    # ──────────────────────────────────────────────────────────────
+    # B3: Per-Region Summary — aggregated error by action region
+    # ──────────────────────────────────────────────────────────────
+    def _plot_B3(self, pred, gt, active_dims, step):
+        """Grouped bar chart showing MAE, correlation, coverage per action region."""
+        B, T, D = pred.shape
+
+        region_stats = {}
+        for start, end, name, color in REGION_DEFS:
+            dims_in = [d for d in active_dims if start <= d < end]
+            if not dims_in:
+                continue
+
+            mae_vals = []
+            corr_vals = []
+            cov_vals = []
+            for d in dims_in:
+                g = gt[:, :, d].flatten()
+                p = pred[:, :, d].flatten()
+                mae_vals.append(np.abs(p - g).mean())
+                if np.std(g) > 1e-8 and np.std(p) > 1e-8:
+                    corr_vals.append(np.corrcoef(g, p)[0, 1])
+                else:
+                    corr_vals.append(0)
+                gt_range = g.max() - g.min() + 1e-8
+                pred_range = p.max() - p.min()
+                cov_vals.append(min(pred_range / gt_range * 100, 200))
+
+            region_stats[name] = {
+                'mae': np.mean(mae_vals),
+                'corr': np.mean(corr_vals),
+                'coverage': np.mean(cov_vals),
+                'n_dims': len(dims_in),
+                'color': color,
+            }
+
+        if not region_stats:
+            return fig_to_wandb_image(plt.figure())
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        names = list(region_stats.keys())
+        x = np.arange(len(names))
+        colors = [region_stats[n]['color'] for n in names]
+
+        # MAE
+        ax = axes[0]
+        vals = [region_stats[n]['mae'] for n in names]
+        bars = ax.bar(x, vals, color=colors, alpha=0.85, edgecolor='white', width=0.6)
+        for bar, v, n in zip(bars, vals, names):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(vals)*0.02,
+                    f'{v:.4f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height()/2,
+                    f'({region_stats[n]["n_dims"]}d)', ha='center', va='center',
+                    fontsize=8, color='white', fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, fontsize=10)
+        ax.set_ylabel('MAE')
+        ax.set_title('Mean Absolute Error ↓', fontsize=11, fontweight='bold')
+
+        # Correlation
+        ax = axes[1]
+        vals = [region_stats[n]['corr'] for n in names]
+        corr_colors = [COLORS['accent'] if c > 0.5 else COLORS['warn'] if c > 0.2 else COLORS['pred']
+                       for c in vals]
+        bars = ax.bar(x, vals, color=corr_colors, alpha=0.85, edgecolor='white', width=0.6)
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width()/2, max(v, 0) + 0.02,
+                    f'{v:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, fontsize=10)
+        ax.set_ylabel('Correlation')
+        ax.set_ylim(-0.1, 1.1)
+        ax.axhline(0.5, color='gray', linestyle='--', alpha=0.5)
+        ax.set_title('Pred↔GT Correlation ↑', fontsize=11, fontweight='bold')
+
+        # Coverage
+        ax = axes[2]
+        vals = [region_stats[n]['coverage'] for n in names]
+        cov_colors = [COLORS['accent'] if c > 80 else COLORS['warn'] if c > 40 else COLORS['pred']
+                      for c in vals]
+        bars = ax.bar(x, vals, color=cov_colors, alpha=0.85, edgecolor='white', width=0.6)
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width()/2, v + 2,
+                    f'{v:.0f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, fontsize=10)
+        ax.set_ylabel('Coverage %')
+        ax.axhline(100, color='black', linestyle='--', alpha=0.5, label='100%')
+        ax.set_ylim(0, max(vals + [100]) * 1.2)
+        ax.legend(fontsize=8)
+        ax.set_title('Range Coverage ↑', fontsize=11, fontweight='bold')
+
+        fig.suptitle(f'B3: Per-Region Action Quality — Step {step}',
+                     fontsize=13, fontweight='bold')
+        plt.tight_layout()
+        return fig_to_wandb_image(fig)
+
+    # ──────────────────────────────────────────────────────────────
+    # B4: Trajectory 2D — Clear multi-panel with error ribbons
+    # (FIXED: replaced confusing 3D with clean 2D per-sample view)
+    # ──────────────────────────────────────────────────────────────
+    def _plot_B4(self, pred, gt, active_dims, step):
+        """2D multi-panel trajectory: XY + XZ views per sample with error lines."""
+        B, T, D = pred.shape
+        if len(active_dims) < 2:
+            return fig_to_wandb_image(plt.figure())
+
+        d0 = active_dims[0]
+        d1 = active_dims[min(1, len(active_dims) - 1)]
+        d2 = active_dims[min(2, len(active_dims) - 1)] if len(active_dims) >= 3 else d0
+        n_show = min(4, B)
+
+        fig, axes = plt.subplots(2, n_show, figsize=(4.5 * n_show, 8),
+                                 squeeze=False)
+
+        for i in range(n_show):
+            # ── Top row: d0 vs d1 (e.g. X vs Y) ──
+            ax = axes[0, i]
+            ax.plot(gt[i, :, d0], gt[i, :, d1], '-o', color=COLORS['gt'],
+                    markersize=3, linewidth=2, alpha=0.8, label='GT', zorder=3)
+            ax.plot(pred[i, :, d0], pred[i, :, d1], '--s', color=COLORS['pred'],
+                    markersize=3, linewidth=1.5, alpha=0.7, label='Pred', zorder=2)
+            # Error lines connecting GT↔Pred at each timestep
+            for t in range(T):
+                ax.plot([gt[i, t, d0], pred[i, t, d0]],
+                        [gt[i, t, d1], pred[i, t, d1]],
+                        '-', color='gray', alpha=0.3, linewidth=0.8, zorder=1)
+            # Start/end markers
+            ax.scatter(gt[i, 0, d0], gt[i, 0, d1], s=80, c=COLORS['accent'],
+                       marker='^', zorder=5, label='Start')
+            ax.scatter(gt[i, -1, d0], gt[i, -1, d1], s=80, c=COLORS['warn'],
+                       marker='v', zorder=5, label='End')
+
+            err = np.abs(pred[i, :, [d0, d1]] - gt[i, :, [d0, d1]]).mean()
+            ax.set_title(f'Sample {i} | MAE={err:.4f}', fontsize=9, fontweight='bold')
+            ax.set_xlabel(f'd{d0} ({_dim_label_short(d0)})', fontsize=8)
+            ax.set_ylabel(f'd{d1} ({_dim_label_short(d1)})', fontsize=8)
+            if i == 0:
+                ax.legend(fontsize=7, loc='best')
+
+            # ── Bottom row: d0 vs d2 (e.g. X vs Z) ──
+            ax2 = axes[1, i]
+            ax2.plot(gt[i, :, d0], gt[i, :, d2], '-o', color=COLORS['gt'],
+                     markersize=3, linewidth=2, alpha=0.8, zorder=3)
+            ax2.plot(pred[i, :, d0], pred[i, :, d2], '--s', color=COLORS['pred'],
+                     markersize=3, linewidth=1.5, alpha=0.7, zorder=2)
+            for t in range(T):
+                ax2.plot([gt[i, t, d0], pred[i, t, d0]],
+                         [gt[i, t, d2], pred[i, t, d2]],
+                         '-', color='gray', alpha=0.3, linewidth=0.8, zorder=1)
+            ax2.scatter(gt[i, 0, d0], gt[i, 0, d2], s=80, c=COLORS['accent'],
+                        marker='^', zorder=5)
+            ax2.scatter(gt[i, -1, d0], gt[i, -1, d2], s=80, c=COLORS['warn'],
+                        marker='v', zorder=5)
+            ax2.set_xlabel(f'd{d0} ({_dim_label_short(d0)})', fontsize=8)
+            ax2.set_ylabel(f'd{d2} ({_dim_label_short(d2)})', fontsize=8)
+
+        avg_err = np.abs(pred[:n_show] - gt[:n_show]).mean()
+        fig.suptitle(f'B4: Action Trajectories (2D views, gray=error) — Step {step} | '
+                     f'Avg Error: {avg_err:.4f}',
                      fontsize=12, fontweight='bold')
         plt.tight_layout()
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # B4: Trajectory 3D — with error coloring
+    # B5: Temporal Error Evolution — how error grows over horizon
+    # (NEW: critical for understanding near-future vs far-future)
     # ──────────────────────────────────────────────────────────────
-    def _plot_B4(self, pred, gt, active_dims, step):
-        fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection='3d')
+    def _plot_B5(self, pred, gt, active_dims, dim_labels, step):
+        """Line plot: error at each timestep across the action horizon.
 
-        d0, d1, d2 = active_dims[0], active_dims[min(1, len(active_dims)-1)], active_dims[min(2, len(active_dims)-1)]
-        n_show = min(8, pred.shape[0])
-        cmap = plt.cm.tab10
+        Shows whether the model is good at near-future (small t) but degrades
+        at far-future (large t), which is typical for action prediction.
+        """
+        B, T, D = pred.shape
 
-        for i in range(n_show):
-            color = cmap(i / max(n_show, 1))
-            ax.plot(gt[i, :, d0], gt[i, :, d1], gt[i, :, d2],
-                    '-', color=color, alpha=0.7, linewidth=2, label=f'GT {i}' if i < 3 else '')
-            ax.plot(pred[i, :, d0], pred[i, :, d1], pred[i, :, d2],
-                    '--', color=color, alpha=0.5, linewidth=1.5)
-            # Start/end markers
-            ax.scatter(*gt[i, 0, [d0, d1, d2]], s=40, c=[color], marker='o', alpha=0.8)
-            ax.scatter(*gt[i, -1, [d0, d1, d2]], s=40, c=[color], marker='s', alpha=0.8)
+        # Per-timestep MAE averaged across batch and active dims
+        error = np.abs(pred - gt)  # [B, T, D]
+        overall_per_t = error[:, :, active_dims].mean(axis=(0, 2))  # [T]
 
-        # Custom legend
-        from matplotlib.lines import Line2D
-        legend_elements = [
-            Line2D([0], [0], color='gray', linewidth=2, linestyle='-', label='GT (solid)'),
-            Line2D([0], [0], color='gray', linewidth=1.5, linestyle='--', label='Pred (dashed)'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=8, label='Start'),
-            Line2D([0], [0], marker='s', color='w', markerfacecolor='gray', markersize=8, label='End'),
-        ]
-        ax.legend(handles=legend_elements, fontsize=8, loc='upper left')
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
-        avg_err = np.abs(pred[:n_show, :, [d0, d1, d2]] - gt[:n_show, :, [d0, d1, d2]]).mean()
-        ax.set_xlabel(f'Dim {d0}')
-        ax.set_ylabel(f'Dim {d1}')
-        ax.set_zlabel(f'Dim {d2}')
-        ax.set_title(f'B4: 3D Action Trajectories — Step {step} | Avg 3D Error: {avg_err:.4f}',
-                     fontsize=12, fontweight='bold')
+        # Left: overall temporal error curve with confidence band
+        ax = axes[0]
+        # Per-sample curves for std band
+        per_sample_t = error[:, :, active_dims].mean(axis=2)  # [B, T]
+        mean_t = per_sample_t.mean(axis=0)
+        std_t = per_sample_t.std(axis=0)
+
+        timesteps = np.arange(T)
+        ax.fill_between(timesteps, mean_t - std_t, mean_t + std_t,
+                        alpha=0.15, color=COLORS['pred'])
+        ax.plot(timesteps, mean_t, '-o', color=COLORS['pred'], linewidth=2.5,
+                markersize=5, label='Mean MAE', zorder=3)
+
+        # Annotate start/end
+        ax.annotate(f't=0: {mean_t[0]:.4f}', xy=(0, mean_t[0]),
+                    fontsize=9, fontweight='bold', color=COLORS['accent'])
+        ax.annotate(f't={T-1}: {mean_t[-1]:.4f}', xy=(T-1, mean_t[-1]),
+                    fontsize=9, fontweight='bold', color=COLORS['pred'],
+                    ha='right')
+
+        # Growth rate
+        if T > 1:
+            growth = (mean_t[-1] - mean_t[0]) / (mean_t[0] + 1e-8) * 100
+            color = COLORS['accent'] if growth < 20 else COLORS['warn'] if growth < 50 else COLORS['pred']
+            ax.text(0.5, 0.95, f'Error growth: {growth:+.1f}% over horizon',
+                    transform=ax.transAxes, fontsize=11, fontweight='bold',
+                    ha='center', va='top', color=color,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+
+        ax.set_xlabel('Timestep t (action horizon)', fontsize=10)
+        ax.set_ylabel('Mean Absolute Error', fontsize=10)
+        ax.set_title('Overall Error vs Timestep', fontsize=11, fontweight='bold')
+        ax.legend(fontsize=9)
+        if T <= 16:
+            ax.set_xticks(timesteps)
+
+        # Right: per-region temporal curves
+        ax2 = axes[1]
+        for start, end, name, color in REGION_DEFS:
+            dims_in = [d for d in active_dims if start <= d < end]
+            if not dims_in:
+                continue
+            region_err = error[:, :, dims_in].mean(axis=(0, 2))  # [T]
+            ax2.plot(timesteps, region_err, '-', color=color, linewidth=2,
+                     label=f'{name} ({len(dims_in)}d)', alpha=0.8)
+
+        ax2.set_xlabel('Timestep t', fontsize=10)
+        ax2.set_ylabel('MAE', fontsize=10)
+        ax2.set_title('Per-Region Error vs Timestep', fontsize=11, fontweight='bold')
+        ax2.legend(fontsize=8, loc='best')
+        if T <= 16:
+            ax2.set_xticks(timesteps)
+
+        fig.suptitle(f'B5: Temporal Error Evolution — Step {step} | T={T} horizon',
+                     fontsize=13, fontweight='bold')
+        plt.tight_layout()
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # C1: Sample Transport — pred positions + drift arrows + GT
+    # C1: Sample Transport — PCA-projected with magnitude colormap
+    # (FIXED: quiver divide-by-zero, PCA projection, bigger arrows)
     # ──────────────────────────────────────────────────────────────
     def _plot_C1(self, pred, gt, drift_field, active_dims, step):
         B, T, D = pred.shape
-        d0, d1 = active_dims[0], active_dims[min(1, len(active_dims)-1)]
-        n = min(B, 60)
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        # drift_field is [N_emb, T*D] (per-embodiment subset, flattened)
+        # Clip n to the smaller of batch size and drift_field rows
+        n_drift = drift_field.shape[0]
+        n = min(B, n_drift, 200)
+        if n < 2:
+            return None
 
-        # Left: transport map
+        # PCA for 2D projection (much better than raw 2 dims)
+        dims = active_dims[:min(24, len(active_dims))]
+        pred_flat = pred[:n, 0, dims]
+        gt_flat = gt[:n, 0, dims]
+        combined = np.vstack([pred_flat, gt_flat])
+        mean_c = combined.mean(axis=0)
+        centered = combined - mean_c
+
+        try:
+            U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+            proj_mat = Vt[:2].T
+            pred_2d = (pred_flat - mean_c) @ proj_mat
+            gt_2d = (gt_flat - mean_c) @ proj_mat
+        except Exception:
+            d0 = active_dims[0]
+            d1 = active_dims[min(1, len(active_dims) - 1)]
+            pred_2d = pred[:n, 0, [d0, d1]]
+            gt_2d = gt[:n, 0, [d0, d1]]
+            proj_mat = None
+
+        # Project drift field to 2D
+        flat_D = drift_field.shape[1]
+        drift_proj = np.zeros((n, len(dims)))
+        for i, d in enumerate(dims):
+            if d < flat_D:
+                drift_proj[:, i] = drift_field[:n, d]
+
+        if proj_mat is not None:
+            try:
+                drift_2d = drift_proj @ proj_mat
+            except Exception:
+                drift_2d = np.zeros((n, 2))
+        else:
+            drift_2d = np.zeros((n, 2))
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+        # Left: PCA transport map
         ax = axes[0]
-        x_pred = pred[:n, 0, d0]
-        y_pred = pred[:n, 0, d1]
-        dx = drift_field[:n, d0] if drift_field.shape[1] > d0 else np.zeros(n)
-        dy = drift_field[:n, d1] if drift_field.shape[1] > d1 else np.zeros(n)
+        mag = np.linalg.norm(drift_2d, axis=1)
+        max_mag = mag.max() + 1e-8
 
-        # GT targets
-        ax.scatter(gt[:n, 0, d0], gt[:n, 0, d1], s=30, c=COLORS['accent'], marker='*',
-                   alpha=0.4, label='GT targets', zorder=1)
-        # Pred before drift
-        ax.scatter(x_pred, y_pred, s=25, c=COLORS['gt'], alpha=0.6, label='Predictions', zorder=2)
-        # Arrows
-        scale_factor = 0.5
-        ax.quiver(x_pred, y_pred, dx * scale_factor, dy * scale_factor,
-                  color='gray', alpha=0.4, scale=None, width=0.003, zorder=3)
-        # Pred after drift
-        ax.scatter(x_pred + dx * scale_factor, y_pred + dy * scale_factor,
-                   s=20, c=COLORS['pred'], alpha=0.5, marker='>', label='After drift', zorder=4)
+        ax.scatter(gt_2d[:, 0], gt_2d[:, 1], s=50, c=COLORS['accent'], marker='*',
+                   alpha=0.4, label='GT', zorder=1)
+        sc = ax.scatter(pred_2d[:, 0], pred_2d[:, 1], s=35, c=mag, cmap='YlOrRd',
+                        alpha=0.7, edgecolors='white', linewidth=0.3, zorder=2)
+        plt.colorbar(sc, ax=ax, label='Drift |V|', shrink=0.8)
 
-        ax.legend(fontsize=8)
-        ax.set_xlabel(f'Dim {d0}')
-        ax.set_ylabel(f'Dim {d1}')
-        ax.set_title('Sample Transport Map')
+        # Arrows with EXPLICIT scale (fixes divide-by-zero RuntimeWarning)
+        scale_val = max_mag / 0.25 if max_mag > 1e-8 else 1.0
+        ax.quiver(pred_2d[:, 0], pred_2d[:, 1],
+                  drift_2d[:, 0], drift_2d[:, 1],
+                  mag, cmap='YlOrRd', alpha=0.5,
+                  scale=scale_val, width=0.004, zorder=3)
 
-        # Right: distance reduction
+        ax.legend(fontsize=9)
+        ax.set_xlabel('PC1', fontsize=10)
+        ax.set_ylabel('PC2', fontsize=10)
+        ax.set_title(f'Transport Map (PCA) | {n} samples', fontsize=11)
+
+        # Right: before/after distance scatter
         ax2 = axes[1]
-        dist_before = np.sqrt((pred[:n, 0, d0] - gt[:n, 0, d0])**2 +
-                              (pred[:n, 0, d1] - gt[:n, 0, d1])**2)
-        dist_after = np.sqrt((pred[:n, 0, d0] + dx * scale_factor - gt[:n, 0, d0])**2 +
-                             (pred[:n, 0, d1] + dy * scale_factor - gt[:n, 0, d1])**2)
+        dist_before = np.linalg.norm(pred_2d - gt_2d, axis=1)
+        dist_after = np.linalg.norm(pred_2d + drift_2d - gt_2d, axis=1)
 
-        ax2.scatter(dist_before, dist_after, s=20, c=COLORS['gt'], alpha=0.6)
-        lim = max(dist_before.max(), dist_after.max()) * 1.1 + 0.01
-        ax2.plot([0, lim], [0, lim], '--', color='gray', alpha=0.5)
-        ax2.fill_between([0, lim], [0, lim], [0, 0], color=COLORS['accent'], alpha=0.1)
+        ax2.scatter(dist_before, dist_after, s=35, c=mag, cmap='YlOrRd',
+                    alpha=0.7, edgecolors='white', linewidth=0.3)
+        lim = max(dist_before.max(), dist_after.max(), 0.01) * 1.15
+        ax2.plot([0, lim], [0, lim], '--', color='gray', alpha=0.5, linewidth=1.5)
+        ax2.fill_between([0, lim], [0, lim], [0, 0], color=COLORS['accent'], alpha=0.08)
+
         improved = (dist_after < dist_before).mean() * 100
-        ax2.set_xlabel('Distance Before Drift')
-        ax2.set_ylabel('Distance After Drift')
-        ax2.set_title(f'Drift Improvement: {improved:.0f}% samples closer to GT')
-        ax2.text(0.05, 0.95, f'Below diagonal = drift helps\n{improved:.0f}% improved',
-                 transform=ax2.transAxes, fontsize=9, va='top',
-                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.85))
+        ax2.set_xlabel('Distance Before Drift', fontsize=10)
+        ax2.set_ylabel('Distance After Drift', fontsize=10)
+        ax2.set_title(f'Drift Improvement: {improved:.0f}% closer to GT',
+                      fontsize=11, fontweight='bold')
+        ax2.set_xlim(0, lim)
+        ax2.set_ylim(0, lim)
+        ax2.set_aspect('equal')
 
-        fig.suptitle(f'C1: Sample Transport Analysis — Step {step}', fontsize=13, fontweight='bold')
+        fig.suptitle(f'C1: Sample Transport (PCA) — Step {step} | Mean |V|={mag.mean():.4f}',
+                     fontsize=13, fontweight='bold')
         plt.tight_layout()
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # C2: Mode Coverage — correlation matrix + coverage bars
+    # C2: Mode Coverage
     # ──────────────────────────────────────────────────────────────
     def _plot_C2(self, pred, gt, active_dims, dim_labels, step):
         B, T, D = pred.shape
-        n = min(len(active_dims), 16)
+        n = min(len(active_dims), 24)
         dims = active_dims[:n]
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 6), gridspec_kw={'width_ratios': [1, 1, 1.2]})
 
-        # Left: GT vs Pred 2D scatter (PCA-like projection)
+        # PCA projection
         ax = axes[0]
-        gt_flat = gt[:, 0, dims]   # [B, n]
+        gt_flat = gt[:, 0, dims]
         pred_flat = pred[:, 0, dims]
-
-        # Simple PCA: project to 2D using first 2 principal components
         combined = np.vstack([gt_flat, pred_flat])
         mean = combined.mean(axis=0)
         centered = combined - mean
         try:
             U, S, Vt = np.linalg.svd(centered, full_matrices=False)
             proj = centered @ Vt[:2].T
-            gt_proj = proj[:B]
-            pred_proj = proj[B:]
+            gt_proj, pred_proj = proj[:B], proj[B:]
         except Exception:
-            gt_proj = gt_flat[:, :2]
-            pred_proj = pred_flat[:, :2]
+            gt_proj, pred_proj = gt_flat[:, :2], pred_flat[:, :2]
 
         ax.scatter(gt_proj[:, 0], gt_proj[:, 1], s=20, c=COLORS['gt'], alpha=0.5, label='GT')
         ax.scatter(pred_proj[:, 0], pred_proj[:, 1], s=20, c=COLORS['pred'], alpha=0.5, label='Pred')
         ax.legend(fontsize=9)
-        ax.set_title('PCA Projection (2D)', fontsize=10)
+        ax.set_title('PCA Projection (2D)')
         ax.set_xlabel('PC1')
         ax.set_ylabel('PC2')
 
-        # Middle: per-dim correlation between pred and GT
+        # Per-dim correlation
         ax2 = axes[1]
         correlations = []
-        for i, d in enumerate(dims):
-            g = gt[:, 0, d]
-            p = pred[:, 0, d]
+        for d in dims:
+            g, p = gt[:, 0, d], pred[:, 0, d]
             if np.std(g) > 1e-8 and np.std(p) > 1e-8:
                 correlations.append(np.corrcoef(g, p)[0, 1])
             else:
@@ -667,16 +1022,16 @@ class VizLogger:
                        for c in correlations]
         ax2.barh(range(n), correlations, color=colors_corr, alpha=0.8, height=0.7)
         ax2.set_yticks(range(n))
-        ax2.set_yticklabels([dim_labels[i][:10] if i < len(dim_labels) else f'd{d}'
-                             for i, d in enumerate(dims)], fontsize=7, fontfamily='monospace')
+        ax2.set_yticklabels([f'd{d} {dim_labels[i][:6]}' for i, d in enumerate(dims)],
+                            fontsize=7, fontfamily='monospace')
         ax2.axvline(0, color='black', linewidth=0.5)
         ax2.axvline(0.5, color='gray', linestyle='--', alpha=0.5)
         ax2.set_xlim(-0.2, 1.05)
-        ax2.set_xlabel('Correlation (pred vs GT)')
-        ax2.set_title(f'Per-Dim Correlation | Mean: {np.mean(correlations):.3f}', fontsize=10)
+        ax2.set_xlabel('Correlation')
+        ax2.set_title(f'Per-Dim Corr | Mean: {np.mean(correlations):.3f}')
         ax2.invert_yaxis()
 
-        # Right: coverage (GT range covered by predictions)
+        # Coverage
         ax3 = axes[2]
         coverages = []
         for d in dims:
@@ -688,16 +1043,401 @@ class VizLogger:
                       for c in coverages]
         ax3.barh(range(n), coverages, color=colors_cov, alpha=0.8, height=0.7)
         ax3.set_yticks(range(n))
-        ax3.set_yticklabels([dim_labels[i][:10] if i < len(dim_labels) else f'd{d}'
-                             for i, d in enumerate(dims)], fontsize=7, fontfamily='monospace')
-        ax3.axvline(100, color='black', linestyle='--', alpha=0.5, label='100% = full coverage')
+        ax3.set_yticklabels([f'd{d} {dim_labels[i][:6]}' for i, d in enumerate(dims)],
+                            fontsize=7, fontfamily='monospace')
+        ax3.axvline(100, color='black', linestyle='--', alpha=0.5, label='100%')
         ax3.set_xlim(0, 155)
         ax3.set_xlabel('Coverage %')
-        ax3.set_title(f'Range Coverage | Mean: {np.mean(coverages):.0f}%', fontsize=10)
+        ax3.set_title(f'Range Coverage | Mean: {np.mean(coverages):.0f}%')
         ax3.legend(fontsize=7)
         ax3.invert_yaxis()
 
-        fig.suptitle(f'C2: Mode Coverage & Correlation Analysis — Step {step}',
+        fig.suptitle(f'C2: Mode Coverage & Correlation — Step {step}',
                      fontsize=13, fontweight='bold')
         plt.tight_layout()
         return fig_to_wandb_image(fig)
+
+    # ──────────────────────────────────────────────────────────────
+    # C3: Action Smoothness — frequency spectrum / jerk analysis
+    # (NEW: does the model predict smooth or jerky actions?)
+    # ──────────────────────────────────────────────────────────────
+    def _plot_C3(self, pred, gt, active_dims, step):
+        """Compare action smoothness: GT vs Pred via velocity/jerk and spectrum.
+
+        - Left: velocity magnitude over time (pred should match GT dynamics)
+        - Center: jerk (3rd derivative) — lower = smoother
+        - Right: frequency spectrum (FFT) — pred should match GT spectrum shape
+        """
+        B, T, D = pred.shape
+        dims = active_dims[:min(8, len(active_dims))]
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # Compute velocity (first difference) across timesteps
+        gt_vel = np.diff(gt[:, :, dims], axis=1)   # [B, T-1, n_dims]
+        pred_vel = np.diff(pred[:, :, dims], axis=1)
+
+        gt_vel_mag = np.linalg.norm(gt_vel, axis=2).mean(axis=0)    # [T-1]
+        pred_vel_mag = np.linalg.norm(pred_vel, axis=2).mean(axis=0)
+
+        # Left: velocity magnitude
+        ax = axes[0]
+        t_vel = np.arange(T - 1) + 0.5
+        ax.plot(t_vel, gt_vel_mag, '-o', color=COLORS['gt'], linewidth=2,
+                markersize=4, label='GT velocity', alpha=0.8)
+        ax.plot(t_vel, pred_vel_mag, '--s', color=COLORS['pred'], linewidth=2,
+                markersize=4, label='Pred velocity', alpha=0.8)
+        ax.set_xlabel('Timestep', fontsize=10)
+        ax.set_ylabel('|Δaction|', fontsize=10)
+        ax.set_title('Velocity Magnitude', fontsize=11, fontweight='bold')
+        ax.legend(fontsize=8)
+
+        # Center: jerk (second difference of velocity = third diff of position)
+        ax2 = axes[1]
+        if T >= 4:
+            gt_jerk = np.diff(gt_vel, axis=1)   # [B, T-2, n_dims]
+            pred_jerk = np.diff(pred_vel, axis=1)
+            gt_jerk_mag = np.linalg.norm(gt_jerk, axis=2).mean(axis=0)    # [T-2]
+            pred_jerk_mag = np.linalg.norm(pred_jerk, axis=2).mean(axis=0)
+
+            t_jerk = np.arange(T - 2) + 1
+            ax2.plot(t_jerk, gt_jerk_mag, '-o', color=COLORS['gt'], linewidth=2,
+                     markersize=4, label=f'GT jerk (μ={gt_jerk_mag.mean():.4f})', alpha=0.8)
+            ax2.plot(t_jerk, pred_jerk_mag, '--s', color=COLORS['pred'], linewidth=2,
+                     markersize=4, label=f'Pred jerk (μ={pred_jerk_mag.mean():.4f})', alpha=0.8)
+            jerk_ratio = pred_jerk_mag.mean() / (gt_jerk_mag.mean() + 1e-8)
+            smooth_label = 'Smoother' if jerk_ratio < 0.8 else 'Jerkier' if jerk_ratio > 1.2 else 'Similar'
+            ax2.text(0.5, 0.95, f'Pred/GT jerk: {jerk_ratio:.2f}× ({smooth_label})',
+                     transform=ax2.transAxes, fontsize=9, ha='center', va='top',
+                     fontweight='bold',
+                     color=COLORS['accent'] if jerk_ratio < 1.2 else COLORS['pred'],
+                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+        ax2.set_xlabel('Timestep', fontsize=10)
+        ax2.set_ylabel('|Δ²action| (jerk)', fontsize=10)
+        ax2.set_title('Jerk (smoothness) ↓ = better', fontsize=11, fontweight='bold')
+        ax2.legend(fontsize=8)
+
+        # Right: frequency spectrum (FFT)
+        ax3 = axes[2]
+        for d_idx, d in enumerate(dims[:4]):  # Show top 4 dims
+            gt_fft = np.abs(np.fft.rfft(gt[:, :, d].mean(axis=0)))
+            pred_fft = np.abs(np.fft.rfft(pred[:, :, d].mean(axis=0)))
+            freqs = np.fft.rfftfreq(T)
+
+            if d_idx == 0:
+                ax3.plot(freqs[1:], gt_fft[1:], '-', color=COLORS['gt'],
+                         alpha=0.6, linewidth=1.5, label='GT')
+                ax3.plot(freqs[1:], pred_fft[1:], '--', color=COLORS['pred'],
+                         alpha=0.6, linewidth=1.5, label='Pred')
+            else:
+                ax3.plot(freqs[1:], gt_fft[1:], '-', color=COLORS['gt'], alpha=0.3, linewidth=1)
+                ax3.plot(freqs[1:], pred_fft[1:], '--', color=COLORS['pred'], alpha=0.3, linewidth=1)
+
+        ax3.set_xlabel('Frequency', fontsize=10)
+        ax3.set_ylabel('Amplitude', fontsize=10)
+        ax3.set_title('Frequency Spectrum (FFT)', fontsize=11, fontweight='bold')
+        ax3.legend(fontsize=8)
+
+        fig.suptitle(f'C3: Action Smoothness Analysis — Step {step}',
+                     fontsize=13, fontweight='bold')
+        plt.tight_layout()
+        return fig_to_wandb_image(fig)
+
+
+# ══════════════════════════════════════════════════════════════
+# D1: Eval Dashboard — visual bar charts (replaces WandB table)
+# (FIXED: tight_layout warning replaced with subplots_adjust)
+# ══════════════════════════════════════════════════════════════
+
+def create_eval_dashboard(per_dataset: dict, per_embodiment: dict, step: int):
+    """Create a visual eval dashboard image to replace the hard-to-read WandB table.
+
+    Args:
+        per_dataset: {ds_name: {'mse': float, 'mae': float, 'corr': float, 'coverage': float, 'emb_name': str}}
+        per_embodiment: {emb_name: {'mse': [float], 'mae': [float], ...}}
+        step: training step
+
+    Returns:
+        wandb.Image of the dashboard
+    """
+    if not HAS_MPL:
+        return None
+
+    _setup_style()
+
+    n_ds = len(per_dataset)
+    if n_ds == 0:
+        return None
+
+    # Sort datasets by embodiment for visual grouping
+    sorted_ds = sorted(per_dataset.items(), key=lambda x: x[1].get('emb_name', ''))
+
+    fig = plt.figure(figsize=(18, max(6, n_ds * 0.55 + 3)))
+    gs = gridspec.GridSpec(1, 4, width_ratios=[1.5, 1.5, 1, 1], wspace=0.35)
+
+    ds_names = [d[0] for d in sorted_ds]
+    emb_names = [d[1].get('emb_name', '?') for d in sorted_ds]
+    y_pos = np.arange(n_ds)
+
+    # Assign colors by embodiment
+    emb_color_map = {}
+    for _, _, name, color in REGION_DEFS:
+        emb_color_map[name.lower()] = color
+    emb_color_map.update({
+        'gripper_eef': '#3498db', 'gripper_joint': '#9b59b6', 'bimanual': '#2ecc71',
+        'dex_hand': '#e74c3c', 'gripper_delta_eef': '#f39c12', 'bimanual_mobile': '#1abc9c',
+    })
+    bar_colors = [emb_color_map.get(e, '#95a5a6') for e in emb_names]
+
+    # ── Panel 1: MSE ──
+    ax1 = fig.add_subplot(gs[0])
+    mse_vals = [d[1].get('mse', 0) for d in sorted_ds]
+    ax1.barh(y_pos, mse_vals, color=bar_colors, alpha=0.85, height=0.65, edgecolor='white')
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels([f'{ds_names[i]}\n({emb_names[i][:8]})' for i in range(n_ds)],
+                        fontsize=7, fontfamily='monospace')
+    for i, v in enumerate(mse_vals):
+        ax1.text(v + max(mse_vals) * 0.02, i, f'{v:.5f}', va='center', fontsize=6, fontfamily='monospace')
+    ax1.set_xlabel('MSE', fontsize=9)
+    ax1.set_title('MSE ↓', fontsize=10, fontweight='bold')
+    ax1.invert_yaxis()
+
+    # ── Panel 2: MAE ──
+    ax2 = fig.add_subplot(gs[1])
+    mae_vals = [d[1].get('mae', 0) for d in sorted_ds]
+    ax2.barh(y_pos, mae_vals, color=bar_colors, alpha=0.85, height=0.65, edgecolor='white')
+    ax2.set_yticks([])
+    for i, v in enumerate(mae_vals):
+        ax2.text(v + max(mae_vals) * 0.02, i, f'{v:.4f}', va='center', fontsize=6, fontfamily='monospace')
+    ax2.set_xlabel('MAE', fontsize=9)
+    ax2.set_title('MAE ↓', fontsize=10, fontweight='bold')
+    ax2.invert_yaxis()
+
+    # ── Panel 3: Correlation ──
+    ax3 = fig.add_subplot(gs[2])
+    corr_vals = [d[1].get('corr', 0) for d in sorted_ds]
+    corr_colors = [COLORS['accent'] if c > 0.5 else COLORS['warn'] if c > 0.2 else COLORS['pred']
+                   for c in corr_vals]
+    ax3.barh(y_pos, corr_vals, color=corr_colors, alpha=0.85, height=0.65, edgecolor='white')
+    ax3.set_yticks([])
+    ax3.axvline(0, color='black', linewidth=0.5)
+    for i, v in enumerate(corr_vals):
+        ax3.text(max(v, 0) + 0.02, i, f'{v:.3f}', va='center', fontsize=6, fontfamily='monospace')
+    ax3.set_xlabel('Correlation', fontsize=9)
+    ax3.set_xlim(-0.1, 1.05)
+    ax3.set_title('Corr ↑', fontsize=10, fontweight='bold')
+    ax3.invert_yaxis()
+
+    # ── Panel 4: Coverage ──
+    ax4 = fig.add_subplot(gs[3])
+    cov_vals = [d[1].get('coverage', 0) for d in sorted_ds]
+    cov_colors = [COLORS['accent'] if c > 80 else COLORS['warn'] if c > 40 else COLORS['pred']
+                  for c in cov_vals]
+    ax4.barh(y_pos, cov_vals, color=cov_colors, alpha=0.85, height=0.65, edgecolor='white')
+    ax4.set_yticks([])
+    ax4.axvline(100, color='black', linestyle='--', alpha=0.5)
+    for i, v in enumerate(cov_vals):
+        ax4.text(min(v, 145) + 2, i, f'{v:.0f}%', va='center', fontsize=6, fontfamily='monospace')
+    ax4.set_xlabel('Coverage %', fontsize=9)
+    ax4.set_xlim(0, 160)
+    ax4.set_title('Coverage ↑', fontsize=10, fontweight='bold')
+    ax4.invert_yaxis()
+
+    # ── Legend: embodiment colors ──
+    unique_embs = sorted(set(emb_names))
+    legend_handles = [Patch(facecolor=emb_color_map.get(e, '#95a5a6'), label=e) for e in unique_embs]
+    fig.legend(handles=legend_handles, loc='lower center', ncol=min(6, len(unique_embs)),
+               fontsize=8, framealpha=0.9, bbox_to_anchor=(0.5, -0.02))
+
+    fig.suptitle(f'D1: Evaluation Dashboard — Step {step} | {n_ds} datasets',
+                 fontsize=13, fontweight='bold')
+    fig.subplots_adjust(left=0.12, right=0.98, bottom=0.08, top=0.92, wspace=0.35)
+    return fig_to_wandb_image(fig)
+
+
+# ══════════════════════════════════════════════════════════════
+# D2: Training Curve Dashboard
+# ══════════════════════════════════════════════════════════════
+
+def create_training_curve_dashboard(
+    loss_history: list,
+    mse_history: list,
+    drift_history: list,
+    steps: list,
+    step: int,
+):
+    """3-panel training curve: loss, MSE, drift norm over all steps.
+
+    Called from train.py at log_every intervals.
+    """
+    if not HAS_MPL or len(steps) < 2:
+        return None
+
+    _setup_style()
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    steps_arr = np.array(steps)
+
+    # Loss
+    ax = axes[0]
+    vals = np.array(loss_history)
+    ax.plot(steps_arr, vals, color=COLORS['gt'], alpha=0.3, linewidth=0.8)
+    if len(vals) >= 5:
+        smoothed = np.array(_ema_smooth(vals.tolist(), alpha=0.1))
+        ax.plot(steps_arr, smoothed, color=COLORS['pred'], linewidth=2.5, label='EMA')
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Loss')
+    ax.set_title('Total Loss ↓', fontsize=11, fontweight='bold')
+    ax.legend(fontsize=8)
+
+    # MSE
+    ax = axes[1]
+    if mse_history:
+        vals = np.array(mse_history)
+        ax.plot(steps_arr[:len(vals)], vals, color=COLORS['gt'], alpha=0.3, linewidth=0.8)
+        if len(vals) >= 5:
+            smoothed = np.array(_ema_smooth(vals.tolist(), alpha=0.1))
+            ax.plot(steps_arr[:len(vals)], smoothed, color=COLORS['accent'], linewidth=2.5, label='EMA')
+        ax.legend(fontsize=8)
+    ax.set_xlabel('Step')
+    ax.set_ylabel('MSE')
+    ax.set_title('MSE Loss ↓', fontsize=11, fontweight='bold')
+
+    # Drift norm
+    ax = axes[2]
+    if drift_history:
+        vals = np.array(drift_history)
+        ax.plot(steps_arr[:len(vals)], vals, color=COLORS['gt'], alpha=0.3, linewidth=0.8)
+        if len(vals) >= 5:
+            smoothed = np.array(_ema_smooth(vals.tolist(), alpha=0.1))
+            ax.plot(steps_arr[:len(vals)], smoothed, color=COLORS['warn'], linewidth=2.5, label='EMA')
+        ax.legend(fontsize=8)
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Drift Norm')
+    ax.set_title('Drift Norm ↓', fontsize=11, fontweight='bold')
+
+    fig.suptitle(f'D2: Training Curves — Step {step}', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    return fig_to_wandb_image(fig)
+
+
+# ══════════════════════════════════════════════════════════════
+# D3: Per-Dataset Learning Curve (across evals)
+# ══════════════════════════════════════════════════════════════
+
+def create_per_dataset_learning_curve(
+    eval_history: dict,
+    step: int,
+):
+    """Line plot: MSE and Correlation per dataset across eval steps.
+
+    eval_history: {ds_name: {'steps': [int], 'mse': [float], 'corr': [float]}}
+    """
+    if not HAS_MPL or not eval_history:
+        return None
+
+    _setup_style()
+
+    # Filter datasets with at least 2 eval points
+    valid = {k: v for k, v in eval_history.items() if len(v.get('steps', [])) >= 2}
+    if not valid:
+        return None
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    cmap = plt.cm.tab20
+
+    # Left: MSE learning curves
+    ax = axes[0]
+    for i, (ds_name, data) in enumerate(sorted(valid.items())):
+        color = cmap(i / max(len(valid), 1))
+        ax.plot(data['steps'], data['mse'], '-o', color=color, markersize=4,
+                linewidth=1.8, label=ds_name, alpha=0.8)
+    ax.set_xlabel('Training Step', fontsize=10)
+    ax.set_ylabel('MSE', fontsize=10)
+    ax.set_title('Per-Dataset MSE ↓', fontsize=11, fontweight='bold')
+    ax.legend(fontsize=7, loc='best', ncol=2)
+
+    # Right: Correlation learning curves
+    ax2 = axes[1]
+    for i, (ds_name, data) in enumerate(sorted(valid.items())):
+        color = cmap(i / max(len(valid), 1))
+        corr_vals = data.get('corr', [])
+        if corr_vals:
+            ax2.plot(data['steps'][:len(corr_vals)], corr_vals, '-o', color=color,
+                     markersize=4, linewidth=1.8, label=ds_name, alpha=0.8)
+    ax2.set_xlabel('Training Step', fontsize=10)
+    ax2.set_ylabel('Correlation', fontsize=10)
+    ax2.set_ylim(-0.1, 1.05)
+    ax2.axhline(0.5, color='gray', linestyle='--', alpha=0.4)
+    ax2.set_title('Per-Dataset Correlation ↑', fontsize=11, fontweight='bold')
+    ax2.legend(fontsize=7, loc='best', ncol=2)
+
+    fig.suptitle(f'D3: Per-Dataset Learning Curves — Step {step}',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    return fig_to_wandb_image(fig)
+
+
+# ══════════════════════════════════════════════════════════════
+# D4: Data Balance Monitor
+# ══════════════════════════════════════════════════════════════
+
+def create_data_balance_monitor(
+    dataset_batch_counts: dict,
+    dataset_sizes: dict,
+    step: int,
+):
+    """Pie + bar: actual sampled batches vs dataset sizes.
+
+    dataset_batch_counts: {ds_name: int} — how many times each dataset appeared in batches
+    dataset_sizes: {ds_name: int} — configured dataset sizes
+    """
+    if not HAS_MPL or not dataset_batch_counts:
+        return None
+
+    _setup_style()
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    names = sorted(dataset_batch_counts.keys())
+    counts = [dataset_batch_counts[n] for n in names]
+    total = sum(counts) + 1e-8
+    pcts = [c / total * 100 for c in counts]
+
+    cmap = plt.cm.tab20
+    colors = [cmap(i / max(len(names), 1)) for i in range(len(names))]
+
+    # Left: pie chart of actual sampling
+    ax = axes[0]
+    wedges, texts, autotexts = ax.pie(
+        counts, labels=None, autopct=lambda p: f'{p:.1f}%' if p > 3 else '',
+        colors=colors, startangle=90, pctdistance=0.75,
+        textprops={'fontsize': 7},
+    )
+    ax.legend(wedges, [f'{n} ({c})' for n, c in zip(names, counts)],
+              loc='center left', bbox_to_anchor=(-0.3, 0.5), fontsize=7)
+    ax.set_title(f'Actual Sampling Distribution\n({sum(counts)} total batch samples)', fontsize=10)
+
+    # Right: configured vs actual bar chart
+    ax2 = axes[1]
+    sizes = [dataset_sizes.get(n, 0) for n in names]
+    total_size = sum(sizes) + 1e-8
+    configured_pct = [s / total_size * 100 for s in sizes]
+
+    x = np.arange(len(names))
+    w = 0.35
+    bars1 = ax2.bar(x - w/2, configured_pct, w, color=colors, alpha=0.5,
+                    edgecolor='white', label='Configured %')
+    bars2 = ax2.bar(x + w/2, pcts, w, color=colors, alpha=0.9,
+                    edgecolor='white', label='Actual %')
+
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(names, fontsize=7, rotation=45, ha='right')
+    ax2.set_ylabel('Percentage %', fontsize=9)
+    ax2.set_title('Configured vs Actual Sampling', fontsize=10, fontweight='bold')
+    ax2.legend(fontsize=8)
+
+    fig.suptitle(f'D4: Data Balance Monitor — Step {step}',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    return fig_to_wandb_image(fig)

@@ -41,9 +41,7 @@ from drifting_vla.models.drifting_vla import DriftingVLA, DriftingVLAConfig
 from drifting_vla.data.unified_dataset import (
     UnifiedDataset, collate_unified, create_weighted_sampler,
 )
-from drifting_vla.data.rlbench_dataset import RLBenchDataset
-from drifting_vla.data.dexgraspnet_dataset import DexGraspNetDataset
-from drifting_vla.data.lerobot_dataset import LeRobotDataset
+from drifting_vla.data.episode_dataset import EpisodeHDF5Dataset
 from drifting_vla.data.action_mapping import (
     UNIFIED_ACTION_DIM, get_action_mask_tensor, DATASET_EMBODIMENT,
     LEROBOT_DATASETS, DATASET_HF_REPOS, DATASET_NATIVE_ACTION_DIM,
@@ -81,6 +79,7 @@ class TrainConfig:
     dataset_weights: Optional[Dict[str, float]] = None  # None = temperature-balanced sampling
     image_size: int = 448
     cameras: List[str] = field(default_factory=lambda: ['front', 'wrist'])
+    data_fraction: float = 1.0            # 1.0 = full data, 0.1 = 10% per dataset
     
     # Training  
     batch_size: int = 16              # Per-GPU; effective = batch × n_gpu × grad_accum
@@ -159,6 +158,12 @@ class DriftingVLATrainer:
         """Build DriftingVLA model."""
         cfg = self.config
         
+        # VLM training mode
+        vlm_mode = getattr(cfg, 'vlm_mode', 'frozen')
+        vlm_freeze = vlm_mode in ('frozen', 'lora')
+        vlm_use_lora = (vlm_mode == 'lora')
+        lora_r = getattr(cfg, 'lora_r', 16)
+        
         model_config = DriftingVLAConfig(
             vlm_model_key=cfg.vlm_model_key,
             hidden_dim=cfg.hidden_dim,
@@ -167,7 +172,12 @@ class DriftingVLATrainer:
             action_horizon=cfg.action_horizon,
             noise_dim=cfg.noise_dim,
             use_flash_attn=cfg.use_flash_attn,
+            vlm_freeze=vlm_freeze,
+            vlm_use_lora=vlm_use_lora,
         )
+        
+        if self.is_main:
+            logger.info(f"  VLM mode: {vlm_mode} (freeze={vlm_freeze}, lora={vlm_use_lora}, r={lora_r})")
         
         self.model = DriftingVLA(model_config).to(self.device)
         
@@ -183,77 +193,89 @@ class DriftingVLATrainer:
             total = sum(p.numel() for p in self.model.parameters())
             logger.info(f"Model: {total:,} params ({trainable:,} trainable)")
     
+    def _load_vlm_processor(self):
+        """Load VLM processor for tokenization in DataLoader workers."""
+        cfg = self.config
+        from drifting_vla.models.vlm_backbone import VLM_SPECS
+        hf_name = VLM_SPECS[cfg.vlm_model_key]['hf_name']
+        try:
+            from transformers import AutoProcessor
+            processor = AutoProcessor.from_pretrained(hf_name)
+            if self.is_main:
+                logger.info(f"Loaded VLM processor: {hf_name} (tokenization in DataLoader workers)")
+            return processor
+        except Exception as e:
+            if self.is_main:
+                logger.warning(f"Failed to load VLM processor: {e}. Falling back to in-forward tokenization.")
+            return None
+    
     def _build_datasets(self):
-        """Build unified dataset from configured sources.
+        """Build unified dataset from Episode HDF5 files.
         
-        Uses rank-0 barrier pattern: if any dataset needs downloading,
-        only rank 0 does it, other ranks wait then load from local cache.
+        Loads from data/episodes/{dataset_name}/ directories.
+        Each dataset has pre-mapped 128-dim actions in HDF5 format.
+        VLM tokenization is done in DataLoader workers (parallel), not in model forward.
         """
         cfg = self.config
+        episodes_root = Path(getattr(cfg, 'episodes_root', cfg.data_root + '/episodes'))
         
-        # --- All ranks load from local Arrow data (fast, no network) ---
         datasets = {}
+        max_samples = getattr(cfg, 'max_samples_per_dataset', None)
+        data_fraction = getattr(cfg, 'data_fraction', 1.0)
+        
+        # Load VLM processor once for all datasets (tokenization in DataLoader)
+        vlm_processor = self._load_vlm_processor()
         
         for ds_name in cfg.datasets:
-            ds_dir = Path(cfg.data_root) / ds_name
+            ep_dir = episodes_root / ds_name
+            
+            if not ep_dir.exists() or not (ep_dir / 'metadata.json').exists():
+                if self.is_main:
+                    logger.warning(f"Episode dir not found: {ep_dir}, skipping {ds_name}")
+                        continue
             
             try:
-                if ds_name == 'rlbench':
-                    if not ds_dir.exists():
-                        if self.is_main:
-                            logger.warning(f"RLBench data not found at {ds_dir}, skipping")
-                        continue
-                    ds = RLBenchDataset(
-                        data_dir=str(ds_dir),
-                        split='train',
-                        image_size=cfg.image_size,
-                        cameras=cfg.cameras,
+                ds = EpisodeHDF5Dataset(
+                    episode_dir=str(ep_dir),
                         action_horizon=cfg.action_horizon,
-                    )
-                elif ds_name == 'dexgraspnet':
-                    if not ds_dir.exists():
-                        if self.is_main:
-                            logger.warning(f"DexGraspNet data not found at {ds_dir}, skipping")
-                        continue
-                    ds = DexGraspNetDataset(
-                        data_dir=str(ds_dir),
+                    num_history_frames=3,
                         image_size=cfg.image_size,
-                        action_horizon=cfg.action_horizon,
+                    max_samples=max_samples,
+                    vlm_processor=vlm_processor,
                     )
-                elif ds_name in LEROBOT_DATASETS:
-                    hf_repo = DATASET_HF_REPOS.get(ds_name)
-                    if hf_repo is None:
+                
+                # Apply data fraction: subsample to percentage of total
+                if 0.0 < data_fraction < 1.0 and len(ds) > 0:
+                    import random
+                    original_len = len(ds)
+                    target_len = max(1, int(original_len * data_fraction))
+                    if target_len < original_len:
+                        random.seed(42)  # Deterministic subsampling
+                        ds.sample_index = random.sample(ds.sample_index, target_len)
                         if self.is_main:
-                            logger.warning(f"No HF repo for {ds_name}, skipping")
-                        continue
-                    
-                    ds = LeRobotDataset(
-                        repo_id=hf_repo,
-                        image_size=cfg.image_size,
-                        action_horizon=cfg.action_horizon,
-                        max_samples=getattr(cfg, 'max_samples_per_dataset', None) or (50 if getattr(cfg, '_test_mode', False) else None),
-                        data_root=cfg.data_root,
-                        ds_name=ds_name,
-                    )
-                else:
-                    if self.is_main:
-                        logger.warning(f"Unknown dataset: {ds_name}, skipping")
-                    continue
+                            logger.info(f"  Data fraction {data_fraction:.0%}: "
+                                       f"{ds_name} {original_len} → {target_len} samples")
                 
                 if len(ds) > 0:
                     datasets[ds_name] = ds
                     if self.is_main:
-                        logger.info(f"  Loaded {ds_name}: {len(ds)} samples")
+                    logger.info(f"  Loaded {ds_name}: {len(ds)} samples")
                 else:
                     if self.is_main:
-                        logger.warning(f"  {ds_name} has 0 samples, skipping")
+                    logger.warning(f"  {ds_name} has 0 samples, skipping")
             except Exception as e:
                 if self.is_main:
-                    logger.error(f"  Failed to load {ds_name}: {e}")
+                logger.error(f"  Failed to load {ds_name}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         if not datasets:
-            raise RuntimeError("No datasets loaded! Run 'python scripts/download_datasets.py --test' first.")
+            raise RuntimeError(
+                "No datasets loaded! Run:\n"
+                "  python scripts/download_datasets.py --dataset <name> --n-samples 50\n"
+                "  python scripts/convert_to_episodes.py --dataset <name> --image-size 448"
+            )
         
         # VLM features directory
         vlm_dir = cfg.vlm_features_dir if Path(cfg.vlm_features_dir).exists() else None
@@ -284,54 +306,55 @@ class DriftingVLATrainer:
         if self.is_main:
             logger.info(f"Dataset: {len(self.unified_dataset)} samples, batch_size={cfg.batch_size}")
     
-    def _ensure_datasets_available(self, cfg):
-        """Rank 0 only: check that arrow_data exists for each dataset.
-        
-        If not, run a lightweight download. Other ranks wait at barrier.
-        """
-        for ds_name in cfg.datasets:
-            if ds_name in LEROBOT_DATASETS:
-                arrow_path = Path(cfg.data_root) / ds_name / 'arrow_data'
-                if not arrow_path.exists():
-                    hf_repo = DATASET_HF_REPOS.get(ds_name)
-                    if hf_repo:
-                        logger.info(f"  Arrow data not found for {ds_name}, downloading...")
-                        self._download_arrow_data(ds_name, hf_repo, cfg)
-    
-    def _download_arrow_data(self, ds_name: str, hf_repo: str, cfg):
-        """Download dataset to arrow_data/ (rank 0 only)."""
-        try:
-            from datasets import load_dataset
-            
-            save_path = Path(cfg.data_root) / ds_name / 'arrow_data'
-            n_samples = getattr(cfg, 'max_samples_per_dataset', None)
-            
-            # Try loading with data_dir="data" first (lerobot v2 format)
-            for data_dir in [None, "data"]:
-                try:
-                    split_str = f'train[:{n_samples}]' if n_samples else 'train'
-                    kwargs = {'split': split_str}
-                    if data_dir:
-                        kwargs['data_dir'] = data_dir
-                    hf_ds = load_dataset(hf_repo, **kwargs)
-                    save_path.mkdir(parents=True, exist_ok=True)
-                    hf_ds.save_to_disk(str(save_path))
-                    logger.info(f"  ✓ Downloaded {ds_name}: {len(hf_ds)} samples")
-                    return
-                except Exception:
-                    continue
-            
-            logger.warning(f"  Could not download {ds_name}")
-        except Exception as e:
-            logger.error(f"  Download failed for {ds_name}: {e}")
-    
     def _build_optimizer(self):
-        """Build optimizer with differential LR."""
+        """Build optimizer with differential LR for VLM/projector/DiT."""
         cfg = self.config
+        unwrapped = self._unwrapped_model()
         
-        param_groups = [
-            {'params': self.model.parameters(), 'lr': cfg.learning_rate},
-        ]
+        vlm_lora_params = []
+        projector_params = []
+        dit_params = []
+        
+        vlm_lr_scale = getattr(cfg, 'vlm_lr_scale', 0.1)
+        
+        for name, param in unwrapped.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'vlm_backbone.vlm' in name:
+                vlm_lora_params.append(param)
+            elif 'vlm_backbone.proj' in name:
+                projector_params.append(param)
+            else:
+                dit_params.append(param)
+        
+        param_groups = []
+        if vlm_lora_params:
+            param_groups.append({
+                'params': vlm_lora_params,
+                'lr': cfg.learning_rate * vlm_lr_scale,
+                'weight_decay': 0.0,
+                'name': 'vlm_lora',
+            })
+        if projector_params:
+            param_groups.append({
+                'params': projector_params,
+                'lr': cfg.learning_rate * 0.5,
+                'weight_decay': cfg.weight_decay,
+                'name': 'projector',
+            })
+        if dit_params:
+            param_groups.append({
+                'params': dit_params,
+                'lr': cfg.learning_rate,
+                'weight_decay': cfg.weight_decay,
+                'name': 'dit',
+            })
+        
+        if self.is_main:
+            for pg in param_groups:
+                n_params = sum(p.numel() for p in pg['params'])
+                logger.info(f"  Optimizer group '{pg.get('name', '?')}': "
+                           f"{n_params:,} params, lr={pg['lr']:.1e}")
         
         self.optimizer = torch.optim.AdamW(
             param_groups,
@@ -376,15 +399,15 @@ class DriftingVLATrainer:
         self.neg_queues = {}
         for emb_id in EMBODIMENT_NAMES.keys():
             self.pos_queues[emb_id] = GlobalSampleQueue(
-                queue_size=cfg.pos_queue_size,
-                action_dim=action_flat_dim,
-                device=torch.device('cpu'),
-            )
+            queue_size=cfg.pos_queue_size,
+            action_dim=action_flat_dim,
+            device=torch.device('cpu'),
+        )
             self.neg_queues[emb_id] = NegativeSampleQueue(
-                queue_size=cfg.neg_queue_size,
-                action_dim=action_flat_dim,
-                device=torch.device('cpu'),
-            )
+            queue_size=cfg.neg_queue_size,
+            action_dim=action_flat_dim,
+            device=torch.device('cpu'),
+        )
         
         # Legacy aliases for backward compat
         self.pos_queue = self.pos_queues.get(0)
@@ -430,7 +453,6 @@ class DriftingVLATrainer:
         cfg = self.config
         
         # Move to device
-        images = batch['images'].to(self.device)       # [B, V_total, 3, H, W]
         actions_gt = batch['actions'].to(self.device)   # [B, T, 128]
         action_mask = batch['action_mask'].to(self.device)  # [B, 128]
         embodiment_id = batch['embodiment_id'].to(self.device)
@@ -446,22 +468,38 @@ class DriftingVLATrainer:
 
         B, T, D = actions_gt.shape
 
-        # VLM encoding: online by default (Pi0-style)
+        # Check for VLM ViT encoder inputs (from DataLoader workers)
+        vlm_input_ids = batch.get('vlm_input_ids', None)
         vlm_features = batch.get('vlm_features', None)
-        vlm_pooled = batch.get('vlm_pooled', None)
-        vlm_attn_mask = batch.get('vlm_attn_mask', None)
-        use_live_vlm = vlm_features is None
+        use_encoder = vlm_input_ids is not None
+        use_precomputed = vlm_features is not None and not use_encoder
 
-        if not use_live_vlm:
-            vlm_features = vlm_features.to(self.device)
-            vlm_pooled = vlm_pooled.to(self.device)
-            if vlm_attn_mask is not None:
-                vlm_attn_mask = vlm_attn_mask.to(self.device)
-        else:
+        # Prepare forward kwargs
+        fwd_kwargs = {}
+        if use_encoder:
+            # Path 1: Vision-encoder-only — ViT + text embed, skip LLM
+            fwd_kwargs['vlm_input_ids'] = vlm_input_ids.to(self.device)
+            fwd_kwargs['vlm_attention_mask'] = batch['vlm_attention_mask'].to(self.device)
+            pv = batch.get('vlm_pixel_values', None)
+            if pv is not None:
+                fwd_kwargs['vlm_pixel_values'] = pv.to(self.device)
+            thw = batch.get('vlm_image_grid_thw', None)
+            if thw is not None:
+                fwd_kwargs['vlm_image_grid_thw'] = thw.to(self.device)
+
+            # Ensure VLM visual encoder is loaded
             model = self._unwrapped_model()
             if not model.vlm_backbone._loaded:
                 model.vlm_backbone.load_vlm(self.device)
-            vlm_attn_mask = None
+        elif use_precomputed:
+            # Path 2: Pre-computed features — offline VLM
+            fwd_kwargs['vlm_features'] = vlm_features.to(self.device)
+            fwd_kwargs['vlm_pooled'] = batch['vlm_pooled'].to(self.device)
+        else:
+            raise RuntimeError(
+                "No VLM inputs found in batch. Either set vlm_processor on dataset "
+                "or provide pre-computed VLM features."
+            )
 
         # Sample noise
         noise = torch.randn(B, T, cfg.noise_dim, device=self.device)
@@ -469,31 +507,16 @@ class DriftingVLATrainer:
         # Sample CFG scale
         cfg_scale = self._sample_cfg_scale(B)
 
-        # Forward pass (with proprio + camera/time metadata)
+        # Forward pass
         with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=cfg.use_amp):
-            if use_live_vlm:
-                language = batch.get('language', [''] * B)
                 actions_pred = self.model(
-                    images=images,
-                    language=language,
+                **fwd_kwargs,
                     noise=noise,
                     embodiment_id=embodiment_id,
                     cfg_scale=cfg_scale,
                     proprio=proprio,
                     num_views=num_views,
                     num_frames=num_frames,
-                )
-            else:
-                actions_pred = self.model(
-                    vlm_features=vlm_features,
-                    vlm_pooled=vlm_pooled,
-                    noise=noise,
-                    embodiment_id=embodiment_id,
-                    cfg_scale=cfg_scale,
-                    proprio=proprio,
-                    num_views=num_views,
-                    num_frames=num_frames,
-                    vlm_attn_mask=vlm_attn_mask,
                 )  # [B, T, 128]
             
             # Apply action mask to predictions
@@ -565,7 +588,7 @@ class DriftingVLATrainer:
                             if loss_out.lambda_V is not None:
                                 lambda_Vs.append(loss_out.lambda_V.item())
                             loss_output = loss_out
-                    except Exception:
+                except Exception:
                         pass
                 
                 # Aggregate
@@ -638,6 +661,9 @@ class DriftingVLATrainer:
             logger.info(f"  Datasets: {cfg.datasets}")
             logger.info(f"  Loss: {cfg.loss_type}")
             logger.info(f"  Batch: {cfg.batch_size} × {cfg.grad_accumulation_steps} = {cfg.batch_size * cfg.grad_accumulation_steps}")
+            data_frac = getattr(cfg, 'data_fraction', 1.0)
+            if data_frac < 1.0:
+                logger.info(f"  Data: {data_frac:.0%} of total per dataset")
             logger.info(f"  Steps: {cfg.max_steps}")
             logger.info(f"  Device: {self.device}")
             logger.info(f"{'='*60}")
@@ -665,9 +691,9 @@ class DriftingVLATrainer:
             running_loss += metrics['loss']
             for k, v in metrics.items():
                 if isinstance(v, (int, float)):
-                    if k not in running_metrics:
-                        running_metrics[k] = 0.0
-                    running_metrics[k] += v
+                if k not in running_metrics:
+                    running_metrics[k] = 0.0
+                running_metrics[k] += v
             
             # Logging
             if self.is_main and (step + 1) % cfg.log_every == 0:
@@ -697,9 +723,42 @@ class DriftingVLATrainer:
                     log_dict['global_step'] = step + 1
                     wandb.log(log_dict, step=step+1)
                 
+                # Track D2 training curve history
+                self.viz_logger._train_loss_steps.append(step + 1)
+                self.viz_logger._train_loss_vals.append(avg_loss)
+                self.viz_logger._train_mse_vals.append(
+                    running_metrics.get('mse_loss', avg_loss * cfg.log_every) / cfg.log_every
+                    if 'mse_loss' in running_metrics else avg_loss)
+                self.viz_logger._train_drift_vals.append(
+                    running_metrics.get('drift_norm', 0) / cfg.log_every
+                    if 'drift_norm' in running_metrics else 0)
+
+                # D2: Training Curve Dashboard (every 500 steps)
+                if self.wandb_run and (step + 1) % 500 == 0:
+                    try:
+                        from drifting_vla.training.visualizations import create_training_curve_dashboard
+                        d2_img = create_training_curve_dashboard(
+                            self.viz_logger._train_loss_vals,
+                            self.viz_logger._train_mse_vals,
+                            self.viz_logger._train_drift_vals,
+                            self.viz_logger._train_loss_steps,
+                            step + 1,
+                        )
+                        if d2_img is not None:
+                            wandb.log({'viz/D2_training_curves': d2_img}, step=step+1)
+                    except Exception as e:
+                        logger.debug(f"D2 viz error: {e}")
+
                 running_loss = 0.0
                 running_metrics = {}
-            
+
+            # Track D4 data balance (count dataset appearances in batches)
+            if self.is_main:
+                ds_names_batch = batch.get('dataset_name', [])
+                for ds_n in ds_names_batch:
+                    self.viz_logger._dataset_batch_counts[ds_n] = \
+                        self.viz_logger._dataset_batch_counts.get(ds_n, 0) + 1
+
             # WandB visualizations (at viz-specific frequencies)
             if self.is_main and self.wandb_run and self._last_pred is not None:
                 self.viz_logger.log_training_viz(
@@ -773,37 +832,44 @@ class DriftingVLATrainer:
                 eval_iter = iter(self.dataloader)
                 batch = next(eval_iter)
             
-            images = batch['images'].to(self.device)
             actions_gt = batch['actions'].to(self.device)
             action_mask = batch['action_mask'].to(self.device)
             embodiment_id = batch['embodiment_id'].to(self.device)
             proprio = batch.get('proprio', None)
             if proprio is not None:
                 proprio = proprio.to(self.device)
-            
+
             B, T, D = actions_gt.shape
             noise = torch.randn(B, T, cfg.noise_dim, device=self.device)
             cfg_scale = torch.ones(B, device=self.device) * 2.0  # Fixed CFG for eval
             
+            # Build VLM forward kwargs (same logic as training_step)
+            fwd_kwargs = {}
+            vlm_input_ids = batch.get('vlm_input_ids', None)
+            vlm_features = batch.get('vlm_features', None)
+            if vlm_input_ids is not None:
+                fwd_kwargs['vlm_input_ids'] = vlm_input_ids.to(self.device)
+                fwd_kwargs['vlm_attention_mask'] = batch['vlm_attention_mask'].to(self.device)
+                pv = batch.get('vlm_pixel_values', None)
+                if pv is not None:
+                    fwd_kwargs['vlm_pixel_values'] = pv.to(self.device)
+                thw = batch.get('vlm_image_grid_thw', None)
+                if thw is not None:
+                    fwd_kwargs['vlm_image_grid_thw'] = thw.to(self.device)
+            elif vlm_features is not None:
+                fwd_kwargs['vlm_features'] = vlm_features.to(self.device)
+                fwd_kwargs['vlm_pooled'] = batch['vlm_pooled'].to(self.device)
+            else:
+                continue  # Skip batches without VLM inputs
+
             with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=cfg.use_amp):
-                if not model.vlm_backbone._loaded:
-                    # Use random features if VLM not loaded
-                    vlm_features = torch.randn(B, 64, model.vlm_hidden_dim, device=self.device)
-                    vlm_pooled = torch.randn(B, model.vlm_hidden_dim, device=self.device)
-                    actions_pred = model(
-                        vlm_features=vlm_features, vlm_pooled=vlm_pooled,
-                        noise=noise, embodiment_id=embodiment_id,
-                        cfg_scale=cfg_scale, proprio=proprio,
-                    )
-                else:
-                    language = batch.get('language', [''] * B)
-                    actions_pred = model(
-                        images=images, language=language,
-                        noise=noise, embodiment_id=embodiment_id,
-                        cfg_scale=cfg_scale, proprio=proprio,
-                        num_views=batch.get('num_views', 1),
-                        num_frames=batch.get('num_frames', 1),
-                    )
+                actions_pred = model(
+                    **fwd_kwargs,
+                    noise=noise, embodiment_id=embodiment_id,
+                    cfg_scale=cfg_scale, proprio=proprio,
+                    num_views=batch.get('num_views', 1),
+                    num_frames=batch.get('num_frames', 1),
+                )
             
             # Mask predictions
             mask = action_mask.unsqueeze(1)
@@ -896,17 +962,113 @@ class DriftingVLATrainer:
                 f"coverage={eval_metrics.get(f'eval/{ds_name}/coverage_pct', 0):.0f}%"
             )
         
-        # Aggregate
+        # ── Aggregate: per-embodiment grouping (reduces 60 dataset keys → 6 embodiment keys) ──
+        from drifting_vla.data.action_mapping import EMBODIMENT_NAMES
+        per_embodiment = {}  # emb_name → {mse: [], mae: [], corr: [], datasets: []}
+        
+        for ds_name, data in per_dataset.items():
+            emb_id = data['emb_id']
+            emb_name = EMBODIMENT_NAMES.get(emb_id, f'emb_{emb_id}')
+            
+            if emb_name not in per_embodiment:
+                per_embodiment[emb_name] = {'mse': [], 'mae': [], 'corr': [], 'coverage': [], 'datasets': []}
+            
+            per_embodiment[emb_name]['mse'].append(eval_metrics.get(f'eval/{ds_name}/mse', 0))
+            per_embodiment[emb_name]['mae'].append(eval_metrics.get(f'eval/{ds_name}/mae', 0))
+            per_embodiment[emb_name]['corr'].append(eval_metrics.get(f'eval/{ds_name}/mean_correlation', 0))
+            per_embodiment[emb_name]['coverage'].append(eval_metrics.get(f'eval/{ds_name}/coverage_pct', 0))
+            per_embodiment[emb_name]['datasets'].append(ds_name)
+        
+        # Log per-embodiment aggregated metrics (6 groups instead of 60 per-dataset)
+        for emb_name, agg in per_embodiment.items():
+            eval_metrics[f'eval_emb/{emb_name}/mse'] = float(np.mean(agg['mse']))
+            eval_metrics[f'eval_emb/{emb_name}/mae'] = float(np.mean(agg['mae']))
+            if any(c != 0 for c in agg['corr']):
+                eval_metrics[f'eval_emb/{emb_name}/correlation'] = float(np.mean([c for c in agg['corr'] if c != 0]))
+            if any(c != 0 for c in agg['coverage']):
+                eval_metrics[f'eval_emb/{emb_name}/coverage_pct'] = float(np.mean([c for c in agg['coverage'] if c != 0]))
+            eval_metrics[f'eval_emb/{emb_name}/n_datasets'] = len(agg['datasets'])
+        
+        # Overall aggregate
         if all_mse:
             eval_metrics['eval/overall_mse'] = float(np.mean(all_mse))
             eval_metrics['eval/overall_mae'] = float(np.mean(all_mae))
         
         eval_metrics['eval/step'] = step
         eval_metrics['eval/n_datasets'] = len(per_dataset)
+        eval_metrics['eval/n_embodiments'] = len(per_embodiment)
         
+        # ── WandB Visual Dashboard: per-dataset bar charts (replaces hard-to-read table) ──
+        if self.wandb_run:
+            try:
+                from drifting_vla.training.visualizations import create_eval_dashboard
+                dashboard_data = {}
+                for ds_name, data in per_dataset.items():
+                    emb_id = data['emb_id']
+                    emb_name = EMBODIMENT_NAMES.get(emb_id, f'emb_{emb_id}')
+                    dashboard_data[ds_name] = {
+                        'mse': eval_metrics.get(f'eval/{ds_name}/mse', 0),
+                        'mae': eval_metrics.get(f'eval/{ds_name}/mae', 0),
+                        'corr': eval_metrics.get(f'eval/{ds_name}/mean_correlation', 0),
+                        'coverage': eval_metrics.get(f'eval/{ds_name}/coverage_pct', 0),
+                        'emb_name': emb_name,
+                    }
+                dashboard_img = create_eval_dashboard(dashboard_data, per_embodiment, step)
+                if dashboard_img is not None:
+                    eval_metrics['viz/D1_eval_dashboard'] = dashboard_img
+
+                # D3: Per-Dataset Learning Curve (track history + plot)
+                for ds_name, data in per_dataset.items():
+                    if ds_name not in self.viz_logger._eval_history:
+                        self.viz_logger._eval_history[ds_name] = {
+                            'steps': [], 'mse': [], 'corr': [],
+                        }
+                    h = self.viz_logger._eval_history[ds_name]
+                    h['steps'].append(step)
+                    h['mse'].append(eval_metrics.get(f'eval/{ds_name}/mse', 0))
+                    h['corr'].append(eval_metrics.get(f'eval/{ds_name}/mean_correlation', 0))
+
+                from drifting_vla.training.visualizations import (
+                    create_per_dataset_learning_curve, create_data_balance_monitor,
+                )
+                d3_img = create_per_dataset_learning_curve(
+                    self.viz_logger._eval_history, step,
+                )
+                if d3_img is not None:
+                    eval_metrics['viz/D3_dataset_learning_curves'] = d3_img
+
+                # D4: Data Balance Monitor
+                if self.viz_logger._dataset_batch_counts:
+                    dataset_sizes = {
+                        ds_name: len(ds) for ds_name, ds in self.unified_dataset.datasets.items()
+                    }
+                    d4_img = create_data_balance_monitor(
+                        self.viz_logger._dataset_batch_counts, dataset_sizes, step,
+                    )
+                    if d4_img is not None:
+                        eval_metrics['viz/D4_data_balance'] = d4_img
+
+            except Exception as e:
+                logger.debug(f"Eval dashboard creation failed: {e}")
+
+        # Remove per-dataset flat keys from wandb logging (keep them only in table)
+        # This prevents 60+ dataset keys from cluttering the dashboard
+        flat_keys_to_remove = [k for k in eval_metrics if k.startswith('eval/') and '/' in k[5:] 
+                               and not k.startswith('eval_emb/') and k != 'eval/overall_mse' 
+                               and k != 'eval/overall_mae' and k != 'eval/step'
+                               and k != 'eval/n_datasets' and k != 'eval/n_embodiments'
+                               and k != 'eval/dataset_detail']
+        for k in flat_keys_to_remove:
+            del eval_metrics[k]
+        
+        # Log summary
         logger.info(f"[Eval] Overall: MSE={eval_metrics.get('eval/overall_mse', 0):.4f}, "
                      f"MAE={eval_metrics.get('eval/overall_mae', 0):.4f}, "
-                     f"datasets={len(per_dataset)}")
+                     f"datasets={len(per_dataset)}, embodiments={len(per_embodiment)}")
+        for emb_name, agg in per_embodiment.items():
+            logger.info(f"  [{emb_name}] MSE={np.mean(agg['mse']):.4f}, "
+                        f"MAE={np.mean(agg['mae']):.4f}, "
+                        f"datasets={agg['datasets']}")
         
         self.model.train()
         return eval_metrics
@@ -944,11 +1106,18 @@ def parse_args():
     parser.add_argument('--model-size', type=str, default='base', choices=['small', 'base', 'large'])
     parser.add_argument('--vlm', type=str, default='qwen3vl', choices=['qwen3vl', 'paligemma2'])
     parser.add_argument('--use-flash-attn', action='store_true', default=False)
-    parser.add_argument('--skip-vlm', action='store_true', default=False,
-                        help='Skip VLM forward (pipeline test only, no VLM download needed)')
+    parser.add_argument('--vlm-mode', type=str, default='frozen',
+                        choices=['frozen', 'lora', 'full'],
+                        help='VLM training: frozen (debug), lora (pre-train), full (post-train)')
+    parser.add_argument('--lora-r', type=int, default=16,
+                        help='LoRA rank (16=pre-train, 64=post-train)')
+    parser.add_argument('--vlm-lr-scale', type=float, default=0.1,
+                        help='VLM learning rate = base_lr × this scale')
     
     # Data
     parser.add_argument('--data-root', type=str, default='./data')
+    parser.add_argument('--episodes-root', type=str, default='./data/episodes',
+                        help='Root directory for Episode HDF5 files')
     parser.add_argument('--datasets', nargs='+', default=['rlbench'])
     parser.add_argument('--vlm-features-dir', type=str, default='./data/vlm_features')
     
@@ -968,6 +1137,9 @@ def parse_args():
                         help='Run evaluation every N steps')
     parser.add_argument('--max-samples', type=int, default=None,
                         help='Max samples per dataset (e.g., 10000 for quick experiments)')
+    parser.add_argument('--data-fraction', type=float, default=1.0,
+                        help='Fraction of total data to use per dataset (0.0-1.0). '
+                             'E.g., 0.1 = use 10%% of each dataset for quick experiments.')
     
     return parser.parse_args()
 
@@ -995,6 +1167,7 @@ def main():
     config.data_root = args.data_root
     config.datasets = args.datasets
     config.vlm_features_dir = args.vlm_features_dir
+    config.episodes_root = args.episodes_root
     config.batch_size = args.batch_size
     config.learning_rate = args.lr
     config.max_steps = args.max_steps
@@ -1006,8 +1179,11 @@ def main():
     config.save_every = args.save_every
     config.eval_every = args.eval_every
     config.use_flash_attn = args.use_flash_attn
-    config.skip_vlm = args.skip_vlm
+    config.vlm_mode = args.vlm_mode
+    config.lora_r = args.lora_r
+    config.vlm_lr_scale = args.vlm_lr_scale
     config.max_samples_per_dataset = args.max_samples
+    config.data_fraction = args.data_fraction
     
     # Model size configs
     size_cfgs = {

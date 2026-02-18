@@ -442,7 +442,7 @@ class LeRobotDataset:
         num_frames = len(frame_offsets)
         images = np.concatenate(all_frame_images, axis=0)
         return images, num_views, num_frames
-    
+
     def _extract_images_lerobot(self, row: dict) -> np.ndarray:
         """Extract ALL RGB views from a lerobot sample."""
         import cv2
@@ -475,7 +475,7 @@ class LeRobotDataset:
             images = [np.zeros((3, self.image_size, self.image_size), dtype=np.float32)]
         
         return np.stack(images, axis=0)
-
+    
     # ──────────────────────────────────────────────────────────────
     # Shared helpers
     # ──────────────────────────────────────────────────────────────
@@ -549,7 +549,7 @@ class LeRobotDataset:
         
         For Arrow backend: reads only the 'action' column (avoids deserializing images).
         """
-        dim = self.action_dim or 7
+            dim = self.action_dim or 7
         
         if len(self._indices) == 0:
             self.action_mean = np.zeros(dim, dtype=np.float32)
@@ -573,13 +573,13 @@ class LeRobotDataset:
                 except Exception:
                     continue
         elif self._backend == 'lerobot':
-            for i in range(n):
-                try:
-                    row = self.lerobot_ds[self._indices[i]]
-                    if 'action' in row:
-                        all_actions.append(row['action'].numpy())
-                except Exception:
-                    continue
+        for i in range(n):
+            try:
+                row = self.lerobot_ds[self._indices[i]]
+                if 'action' in row:
+                    all_actions.append(row['action'].numpy())
+            except Exception:
+                continue
         
         if not all_actions:
             self.action_mean = np.zeros(dim, dtype=np.float32)

@@ -27,6 +27,9 @@ from typing import List, Tuple, Optional
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
+# Suppress verbose Open3D / FEngine / EGL logs
+os.environ.setdefault('OPEN3D_LOG_LEVEL', 'WARNING')
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
@@ -363,9 +366,11 @@ def render_all_scenes(data_dir: str, output_dir: str, n_views: int = 8,
         # Generate camera viewpoints
         viewpoints = generate_camera_viewpoints(center, n_views=n_views)
         
-        # Render
+        # Render (suppress verbose EGL/FEngine stderr)
         try:
-            images = render_scene_open3d(objects, viewpoints, image_size)
+            import io, contextlib
+            with contextlib.redirect_stderr(io.StringIO()):
+                images = render_scene_open3d(objects, viewpoints, image_size)
         except Exception as e:
             logger.warning(f"Render failed for {scene_name}: {e}")
             skipped_count += 1

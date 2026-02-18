@@ -203,7 +203,9 @@ class CrossAttention(nn.Module):
         Args:
             query: Query tokens [B, Lq, D] (noise/action tokens).
             context: Context tokens [B, Lc, D] (visual + language).
-            attention_mask: Optional mask [B, Lq, Lc].
+            attention_mask: Optional key-value mask [B, Lc] bool where
+                True=real token, False=padding. Prevents query tokens
+                from attending to padding positions in context.
         
         Returns:
             Output tokens [B, Lq, D].
@@ -227,7 +229,14 @@ class CrossAttention(nn.Module):
         # Compute attention
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         
+        # Apply attention mask: [B, Lc] bool → [B, 1, 1, Lc] for broadcasting
         if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                # KV mask: [B, Lc] → mask out padding positions in context
+                kv_mask = ~attention_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, Lc], True=mask
+                attn = attn.masked_fill(kv_mask, float('-inf'))
+            else:
+                # Legacy: [B, Lq, Lc] explicit mask
             attn = attn.masked_fill(attention_mask.unsqueeze(1) == 0, float('-inf'))
         
         attn = F.softmax(attn, dim=-1)

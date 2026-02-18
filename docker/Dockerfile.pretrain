@@ -1,0 +1,149 @@
+# =============================================================================
+# Drifting-VLA Pre-Training Docker Image
+# =============================================================================
+# Vision-encoder-only architecture (Pi0 style) — ViT encoder + text embeddings,
+# LLM decoder is never loaded or run.
+#
+# Build:
+#   docker build -f docker/Dockerfile.pretrain -t drifting-vla:pretrain .
+#
+# Run (development — code synced from host):
+#   docker run --gpus all --ipc=host --ulimit memlock=-1 \
+#       -v $(pwd):/workspace \
+#       -v $(pwd)/data:/workspace/data \
+#       drifting-vla:pretrain bash
+#
+# Run (training, 8×A40/H100, LoRA VLM, 11 datasets):
+#   docker run --gpus all --ipc=host --ulimit memlock=-1 \
+#       -v $(pwd):/workspace \
+#       -v $(pwd)/data:/workspace/data \
+#       -e WANDB_API_KEY=$WANDB_API_KEY \
+#       drifting-vla:pretrain \
+#       torchrun --nproc_per_node=8 scripts/train.py \
+#           --datasets aloha bc_z behavior1k_t0000 cmu_stretch dexgraspnet \
+#               dexwild nyu_franka rlbench stanford_hydra taco_play utaustin_mutex \
+#           --episodes-root ./data/episodes \
+#           --batch-size 32 --grad-accumulation 2 \
+#           --max-steps 2500 --lr 1e-4 \
+#           --vlm-mode lora --lora-r 16 --vlm-lr-scale 0.1 \
+#           --loss-type hybrid --model-size base \
+#           --wandb-mode online --wandb-project drifting-vla
+#
+# Run (data preparation):
+#   docker run --gpus all \
+#       -v $(pwd):/workspace \
+#       -v $(pwd)/data:/workspace/data \
+#       drifting-vla:pretrain \
+#       bash -c "python scripts/download_datasets.py --all && \
+#                python scripts/convert_to_episodes.py --all --image-size 448"
+#
+# Run (quick experiment with 10% data):
+#   docker run --gpus all --ipc=host --ulimit memlock=-1 \
+#       -v $(pwd):/workspace \
+#       -v $(pwd)/data:/workspace/data \
+#       drifting-vla:pretrain \
+#       bash -c "python scripts/download_datasets.py --all --data-fraction 0.1 && \
+#                python scripts/convert_to_episodes.py --all --image-size 448 --data-fraction 0.1 && \
+#                torchrun --nproc_per_node=8 scripts/train.py \
+#                    --datasets aloha bc_z rlbench dexgraspnet \
+#                    --episodes-root ./data/episodes \
+#                    --batch-size 32 --grad-accumulation 2 --max-steps 500 \
+#                    --data-fraction 0.1 --vlm-mode frozen --wandb-mode disabled"
+# =============================================================================
+
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# ── System packages ──
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build git wget curl unzip \
+    python3.10 python3.10-dev python3.10-venv python3-pip \
+    libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    libglew-dev libosmesa6-dev xvfb x11-utils \
+    libhdf5-dev liblz4-dev libzstd-dev \
+    openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && python -m pip install --upgrade pip setuptools wheel
+
+# ── PyTorch + CUDA 12.1 ──
+RUN pip install --no-cache-dir \
+    torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# ── Flash Attention 2 (optional, for H100/B200) ──
+RUN pip install --no-cache-dir flash-attn==2.5.0 --no-build-isolation || true
+
+# ── VLM + fine-tuning ──
+RUN pip install --no-cache-dir \
+    "transformers>=4.57" \
+    "accelerate>=0.27.0" \
+    "peft>=0.8.0" \
+    "safetensors>=0.4.2" \
+    "huggingface-hub>=0.21.0" \
+    qwen-vl-utils
+
+# ── Data loading (LeRobot API + HDF5) ──
+RUN pip install --no-cache-dir \
+    lerobot \
+    "datasets>=2.18.0" \
+    "h5py>=3.10.0"
+
+# ── Scientific computing ──
+RUN pip install --no-cache-dir \
+    "numpy>=1.26" \
+    "scipy>=1.12" \
+    "scikit-learn>=1.4"
+
+# ── Image/video processing ──
+RUN pip install --no-cache-dir \
+    "opencv-python-headless>=4.9" \
+    "Pillow>=10.2"
+
+# ── Visualization + logging ──
+RUN pip install --no-cache-dir \
+    "wandb>=0.16" \
+    "matplotlib>=3.8"
+
+# ── Utilities ──
+RUN pip install --no-cache-dir \
+    "einops>=0.7" \
+    "tqdm>=4.66" \
+    "rich>=13.7" \
+    "open3d>=0.18"
+
+# ── Environment ──
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="${CUDA_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+ENV WANDB_MODE=online
+ENV WANDB_SILENT=true
+# Prevent file locking issues with HDF5 in distributed training
+ENV HDF5_USE_FILE_LOCKING=FALSE
+# Prevent NCCL P2P hangs on PCIe GPU topologies (e.g., A40)
+ENV NCCL_P2P_DISABLE=1
+# Optimize CUDA memory allocation
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+WORKDIR /workspace
+
+# ── Copy project (base layer — overridden by volume mount in dev) ──
+COPY . /workspace/
+RUN pip install --no-cache-dir -e .
+
+# ── Health check: verify all key imports ──
+RUN python -c "\
+from drifting_vla.models.vlm_backbone import VLMBackbone, VLMConfig; \
+from drifting_vla.models.drifting_vla import DriftingVLA, DriftingVLAConfig; \
+from drifting_vla.data.episode_dataset import EpisodeHDF5Dataset; \
+from drifting_vla.data.action_mapping import map_to_unified; \
+from drifting_vla.training.visualizations import VizLogger; \
+print('All imports OK')"
+
+CMD ["/bin/bash"]

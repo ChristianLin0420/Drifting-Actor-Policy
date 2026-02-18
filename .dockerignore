@@ -1,0 +1,30 @@
+# Data (mounted as volume at runtime, never baked into image)
+data/
+wandb/
+checkpoints/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.eggs/
+
+# IDE / OS
+.git/
+.vscode/
+.cursor/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs & temp
+*.log
+tmp/
+
+
+
+

@@ -131,7 +131,7 @@ class DexGraspNetDataset:
         # --- Strategy 2: HDF5 files (pre-processed format) ---
         if not samples:
             h5_files = list(self.data_dir.rglob('*.h5')) + list(self.data_dir.rglob('*.hdf5'))
-            if h5_files:
+        if h5_files:
                 samples.extend(self._index_h5_files(h5_files))
         
         # --- Strategy 3: Gripper grasps (simpler format, no images) ---
@@ -250,13 +250,13 @@ class DexGraspNetDataset:
                 with h5py.File(str(h5_path), 'r') as f:
                     for key in ['grasp_poses', 'grasps']:
                         if key in f:
-                            n = f[key].shape[0]
-                            for i in range(n):
-                                samples.append({
+                                n = f[key].shape[0]
+                                for i in range(n):
+                                    samples.append({
                                     'format': 'h5', 'path': str(h5_path),
                                     'index': i, 'group': key,
-                                })
-                            break
+                                    })
+                                break
             except Exception as e:
                 logger.warning(f"Failed to index {h5_path}: {e}")
         return samples
@@ -399,7 +399,7 @@ class DexGraspNetDataset:
             action = np.zeros(23, dtype=np.float32)
             action[:min(17, len(pose))] = pose[:17]
         except Exception:
-            action = np.zeros(23, dtype=np.float32)
+        action = np.zeros(23, dtype=np.float32)
         
         # Try to load scene images
         images = self._load_scene_images(info.get('scene_imgs_dir'))
@@ -487,18 +487,18 @@ class DexGraspNetDataset:
                 data = h5_file[key]
                 if hasattr(data, 'shape') and data.ndim >= 3 and idx < data.shape[0]:
                     import cv2
-                    img = np.array(data[idx], dtype=np.uint8)
-                    if img.ndim == 3:
+                        img = np.array(data[idx], dtype=np.uint8)
+        if img.ndim == 3:
                         img = img[np.newaxis]
-                    V = img.shape[0]
-                    result = np.zeros((V, 3, self.image_size, self.image_size), dtype=np.float32)
-                    for v in range(V):
-                        frame = img[v]
-                        if frame.shape[0] != self.image_size or frame.shape[1] != self.image_size:
-                            frame = cv2.resize(frame, (self.image_size, self.image_size))
-                        result[v] = frame.transpose(2, 0, 1).astype(np.float32) / 255.0
-                    return result
-        
+        V = img.shape[0]
+        result = np.zeros((V, 3, self.image_size, self.image_size), dtype=np.float32)
+        for v in range(V):
+            frame = img[v]
+            if frame.shape[0] != self.image_size or frame.shape[1] != self.image_size:
+                frame = cv2.resize(frame, (self.image_size, self.image_size))
+            result[v] = frame.transpose(2, 0, 1).astype(np.float32) / 255.0
+        return result
+    
         return np.zeros((1, 3, self.image_size, self.image_size), dtype=np.float32)
     
     def _get_h5_language(self, h5_file, idx) -> str:
