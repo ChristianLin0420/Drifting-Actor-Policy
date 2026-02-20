@@ -100,6 +100,14 @@ class VLMBackbone(nn.Module):
         self.vlm = None
         self._loaded = False
         
+        # Visual dim projection (Qwen3-VL ViT outputs 1024, LLM embed_tokens is 2048)
+        # This handles the dim mismatch when using vision-encoder-only architecture
+        vis_encoder_dim = {'qwen3vl': 1024, 'paligemma2': 2048}.get(self.config.model_key, self.vlm_hidden_dim)
+        if vis_encoder_dim != self.vlm_hidden_dim:
+            self.vis_proj = nn.Linear(vis_encoder_dim, self.vlm_hidden_dim)
+        else:
+            self.vis_proj = None
+        
         # Projection: vlm_hidden_dim → dit_hidden_dim
         self.proj_seq = nn.Sequential(
             nn.Linear(self.vlm_hidden_dim, self.config.dit_hidden_dim),
@@ -353,10 +361,25 @@ class VLMBackbone(nn.Module):
             visual_tokens: [N_total_merged_tokens, 2048]
         """
         visual_out = self.vlm.model.visual(pixel_values, image_grid_thw)
-        # visual_out is (hidden_states, deepstack_list) — take hidden_states
+        # visual_out can be:
+        #   - tuple: (hidden_states, deepstack_list)
+        #   - BaseModelOutputWithDeepstackFeatures: .last_hidden_state
+        #   - plain tensor
         if isinstance(visual_out, tuple):
-            return visual_out[0]
-        return visual_out
+            hidden = visual_out[0]
+        elif hasattr(visual_out, 'last_hidden_state'):
+            hidden = visual_out.last_hidden_state
+        elif hasattr(visual_out, 'hidden_states'):
+            hidden = visual_out.hidden_states
+        else:
+            hidden = visual_out
+
+        # Qwen3-VL ViT outputs 1024-dim but LLM embed_tokens is 2048-dim.
+        # Use the registered vis_proj to match dimensions.
+        if self.vis_proj is not None and hidden.shape[-1] != self.vlm_hidden_dim:
+            hidden = self.vis_proj(hidden.to(self.vis_proj.weight.dtype))
+
+        return hidden
 
     def _forward_paligemma_visual(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Run PaliGemma2 vision tower only.

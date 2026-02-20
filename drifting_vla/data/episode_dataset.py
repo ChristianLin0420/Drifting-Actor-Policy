@@ -79,6 +79,8 @@ class EpisodeHDF5Dataset(Dataset):
         stride: int = 1,
         max_samples: Optional[int] = None,
         vlm_processor=None,
+        image_aug: bool = False,
+        cond_mask_prob: float = 0.0,
     ):
         self.episode_dir = Path(episode_dir)
         self.action_horizon = action_horizon
@@ -86,6 +88,8 @@ class EpisodeHDF5Dataset(Dataset):
         self.image_size = image_size
         self.stride = stride
         self.vlm_processor = vlm_processor
+        self.image_aug = image_aug
+        self.cond_mask_prob = cond_mask_prob
 
         # Load metadata
         metadata_path = self.episode_dir / 'metadata.json'
@@ -217,6 +221,16 @@ class EpisodeHDF5Dataset(Dataset):
         else:
             proprio = np.zeros(128, dtype=np.float32)
 
+        # ── Condition masking for classifier-free guidance (RDT-1B style) ──
+        # Randomly drop language, images, or proprio with probability cond_mask_prob
+        if self.cond_mask_prob > 0:
+            if np.random.random() < self.cond_mask_prob:
+                language = ""        # Drop language
+            if np.random.random() < self.cond_mask_prob:
+                images = np.zeros_like(images)  # Drop images (black)
+            if np.random.random() < self.cond_mask_prob:
+                proprio = np.zeros(128, dtype=np.float32)  # Drop proprio
+
         return {
             'images': torch.from_numpy(images).float(),
             'actions': torch.from_numpy(actions.astype(np.float32)),
@@ -274,20 +288,29 @@ class EpisodeHDF5Dataset(Dataset):
         """Load multi-frame × multi-view images.
 
         Returns: [num_frames * num_views, 3, H, W] float32 [0, 1]
-        Order: frame-major, view-minor
+        Order: frame-major, view-minor.
+        
+        When n_views=0 (datasets without images, e.g., bc_z in parquet form),
+        returns a single background image per frame (RDT-1B style: replace
+        missing cameras with processor-mean-colored background).
         """
         images = []
-        for fi in frame_indices:
-            for v in range(n_views):
-                key = f'images/view_{v}'
-                if key in f:
-                    img = f[key][fi]  # [H, W, 3] uint8
-                    img = self._preprocess_image(img)
-                    images.append(img)
-                else:
-                    images.append(np.zeros((3, self.image_size, self.image_size), dtype=np.float32))
+        if n_views == 0:
+            # No cameras — produce 1 background image per frame
+            for _ in frame_indices:
+                images.append(np.zeros((3, self.image_size, self.image_size), dtype=np.float32))
+        else:
+            for fi in frame_indices:
+                for v in range(n_views):
+                    key = f'images/view_{v}'
+                    if key in f:
+                        img = f[key][fi]  # [H, W, 3] uint8
+                        img = self._preprocess_image(img)
+                        images.append(img)
+                    else:
+                        images.append(np.zeros((3, self.image_size, self.image_size), dtype=np.float32))
 
-        return np.stack(images, axis=0)  # [F*V, 3, H, W]
+        return np.stack(images, axis=0)  # [F*V, 3, H, W] or [F, 3, H, W] if no views
 
     def _load_images_static(self, f: h5py.File, n_views: int) -> np.ndarray:
         """Load all views for static scene (1 frame)."""
@@ -313,9 +336,46 @@ class EpisodeHDF5Dataset(Dataset):
         return np.stack(images, axis=0)
 
     def _preprocess_image(self, img: np.ndarray) -> np.ndarray:
-        """Convert [H, W, 3] uint8 → [3, H, W] float32 [0, 1]."""
+        """Convert [H, W, 3] uint8 → [3, image_size, image_size] float32 [0, 1].
+
+        Pipeline (RDT-1B style):
+          1. Pad to square (shorter side padded with black)
+          2. Resize to image_size × image_size
+          3. Optional ColorJitter augmentation (50% probability)
+          4. Normalize to [0, 1] float32
+        
+        Images are stored at original resolution in HDF5;
+        all resizing happens here at training time.
+        """
+        H, W = img.shape[:2]
+
+        # Step 1: Pad to square (RDT-1B uses processor-mean color; we use black)
+        if H != W:
+            size = max(H, W)
+            padded = np.zeros((size, size, 3), dtype=np.uint8)
+            y_off = (size - H) // 2
+            x_off = (size - W) // 2
+            padded[y_off:y_off + H, x_off:x_off + W] = img
+            img = padded
+
+        # Step 2: Resize to target size
         if img.shape[0] != self.image_size or img.shape[1] != self.image_size:
             img = cv2.resize(img, (self.image_size, self.image_size))
+
+        # Step 3: Image augmentation (RDT-1B style)
+        if self.image_aug and np.random.random() > 0.5:
+            try:
+                from PIL import Image as PILImage
+                from torchvision import transforms
+                pil_img = PILImage.fromarray(img)
+                pil_img = transforms.ColorJitter(
+                    brightness=0.3, contrast=0.4, saturation=0.5, hue=0.03
+                )(pil_img)
+                img = np.array(pil_img)
+            except Exception:
+                pass
+
+        # Step 4: Normalize
         img = img.astype(np.float32) / 255.0
         img = img.transpose(2, 0, 1)  # [3, H, W]
         return img

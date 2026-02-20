@@ -1,43 +1,54 @@
-export TMPDIR=~/tmp && mkdir -p $TMPDIR
-
-# ============================================================
-# Step 1: Download datasets (10K samples each, with images + language)
-# Skips if arrow_data/ or .npy data already exists
-# ============================================================
-python scripts/download_datasets.py --n-samples 10000 --dataset aloha
-python scripts/download_datasets.py --n-samples 10000 --dataset rlbench
-python scripts/download_datasets.py --n-samples 10000 --dataset bc_z
-python scripts/download_datasets.py --n-samples 10000 --dataset taco_play
-python scripts/download_datasets.py --n-samples 10000 --dataset utaustin_mutex
-python scripts/download_datasets.py --n-samples 10000 --dataset cmu_stretch
-python scripts/download_datasets.py --n-samples 10000 --dataset nyu_franka
-python scripts/download_datasets.py --n-samples 10000 --dataset stanford_hydra
-python scripts/download_datasets.py --n-samples 10000 --dataset behavior1k_t0000
-python scripts/download_datasets.py --n-samples 10000 --dataset dexgraspnet
-
-# ============================================================
-# Step 2: Render 8-view RGB for DexGraspNet (requires meshdata)
-# ============================================================
-python scripts/render_dexgraspnet.py --max-scenes 100 --n-views 8
-
-# ============================================================
-# Step 3: 8-GPU training
+#!/bin/bash
+# =============================================================================
+# Drifting-VLA End-to-End Pipeline
+# =============================================================================
+# Parallel data preparation + 8-GPU training.
+# Data prep automatically skips already-prepared datasets (checks metadata.json).
 #
-# 10K samples × 9 datasets = ~90K total + DexGraspNet scenes
-# Effective batch = 16 × 8 GPUs × 2 accum = 256
-# 10K steps at 0.15 steps/s ≈ 18 hours (with live VLM)
-# Pre-compute VLM features first for 10× speedup
-# ============================================================
+# Usage (host):    bash test.sh
+# Usage (Docker):  docker run --gpus all --ipc=host --ulimit memlock=-1 \
+#                      -v $(pwd):/workspace -v $(pwd)/data:/workspace/data \
+#                      -e WANDB_API_KEY=$WANDB_API_KEY \
+#                      -it drifting-vla:pretrain bash test.sh
+# =============================================================================
+sleep 4h
+set -e
+
+# =============================================================================
+# Step 1: Prepare data (parallel, auto-skip done, RGB-only)
+# =============================================================================
+# --parallel 3: process 3 datasets simultaneously
+# --rgb-only: exclude depth/segmentation images (default)
+# --cleanup: free HF cache after each dataset
+# Automatically skips datasets with existing metadata.json
+
+# python scripts/prepare_data.py \
+#     --datasets bc_z taco_play \
+#     --parallel 2 --cleanup
+
+# =============================================================================
+# Step 2: 8-GPU Training (5 datasets, 3 embodiment types)
+# =============================================================================
+# aloha (bimanual), bc_z (gripper_joint), taco_play (gripper_joint),
+# stanford_hydra (delta_eef), cmu_stretch (delta_eef)
+# Effective batch: 32/gpu × 2 accum × 8 GPUs = 512 global
+
+export PYTHONUNBUFFERED=1
+export HDF5_USE_FILE_LOCKING=FALSE
+export NCCL_P2P_DISABLE=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TOKENIZERS_PARALLELISM=false
+
 torchrun --nproc_per_node=8 scripts/train.py \
-    --datasets aloha rlbench bc_z taco_play utaustin_mutex cmu_stretch nyu_franka stanford_hydra behavior1k_t0000 dexgraspnet \
-    --max-samples 10000 \
+    --datasets aloha bc_z taco_play stanford_hydra cmu_stretch \
+    --episodes-root ./data/episodes \
     --batch-size 32 \
-    --grad-accumulation 4 \
+    --grad-accumulation 2 \
     --max-steps 10000 \
     --lr 1e-4 \
-    --loss-type hybrid \
-    --wandb-mode online \
-    --log-every 50 \
-    --save-every 1000 \
-    --eval-every 1000 \
-    --data-root ./data
+    --vlm-mode lora --lora-r 16 --vlm-lr-scale 0.1 \
+    --loss-type hybrid --model-size base \
+    --num-workers 8 \
+    --image-aug --cond-mask-prob 0.1 \
+    --log-every 50 --eval-every 500 --save-every 2500 \
+    --wandb-mode online --wandb-project drifting-vla

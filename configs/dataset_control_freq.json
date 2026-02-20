@@ -1,0 +1,15 @@
+{
+    "rlbench": 20,
+    "aloha": 50,
+    "droid": 15,
+    "bc_z": 10,
+    "taco_play": 15,
+    "utaustin_mutex": 20,
+    "cmu_stretch": 10,
+    "nyu_franka": 3,
+    "stanford_hydra": 10,
+    "dexgraspnet": 1,
+    "dexwild": 30,
+    "behavior1k_t0000": 30
+}
+

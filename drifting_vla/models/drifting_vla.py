@@ -70,6 +70,10 @@ class DriftingVLAConfig:
     cfg_dropout: float = 0.1
     cfg_scale_range: Tuple[float, float] = (1.0, 4.0)
 
+    # Control frequency conditioning (RDT-1B style)
+    use_ctrl_freq: bool = True
+    max_ctrl_freq: int = 100  # max control frequency in Hz
+
     # Architecture options
     use_flash_attn: bool = True
     use_rope: bool = True
@@ -140,6 +144,12 @@ class DriftingVLA(nn.Module):
 
         # ── NEW: Timestep embedding (which frame in history) ──
         self.history_time_embed = nn.Embedding(config.max_history_steps, config.hidden_dim)
+
+        # ── NEW: Control frequency embedding (RDT-1B style) ──
+        if config.use_ctrl_freq:
+            self.freq_embed = nn.Embedding(config.max_ctrl_freq + 1, config.hidden_dim)
+        else:
+            self.freq_embed = None
 
         # Cross-attention fusion (noise attends to VLM features)
         fusion_config = FusionConfig(
@@ -309,6 +319,8 @@ class DriftingVLA(nn.Module):
         num_views: int = 1,
         num_frames: int = 1,
         tokens_per_image: Optional[List[int]] = None,
+        # Control frequency conditioning (RDT-1B style)
+        ctrl_freqs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass with 2 VLM input modes:
@@ -364,6 +376,11 @@ class DriftingVLA(nn.Module):
         if proprio is not None and self.proprio_embed is not None:
             proprio_emb = self.proprio_embed(proprio.float())
             c_global = c_global + proprio_emb
+
+        # --- Add control frequency conditioning (RDT-1B style) ---
+        if ctrl_freqs is not None and self.freq_embed is not None:
+            freq_ids = ctrl_freqs.clamp(0, self.config.max_ctrl_freq).long()
+            c_global = c_global + self.freq_embed(freq_ids)
 
         # --- Noise to tokens ---
         noise_tokens = self.noise_tokenizer(noise)

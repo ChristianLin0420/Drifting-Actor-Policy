@@ -503,9 +503,17 @@ def collate_unified(batch: List[dict]) -> dict:
             result['vlm_pixel_values'] = torch.cat(pv_list, dim=0)  # [N_total_patches, C]
 
         # image_grid_thw: [N_images, 3] per sample — concatenate all
+        # Some samples may produce 1D tensors (single image), ensure all are 2D
         if 'vlm_image_grid_thw' in batch[0]:
-            thw_list = [s['vlm_image_grid_thw'] for s in batch]
-            result['vlm_image_grid_thw'] = torch.cat(thw_list, dim=0)  # [N_total_images, 3]
+            thw_list = []
+            for s in batch:
+                thw = s.get('vlm_image_grid_thw')
+                if thw is not None:
+                    if thw.dim() == 1:
+                        thw = thw.unsqueeze(0)  # [3] → [1, 3]
+                    thw_list.append(thw)
+            if thw_list:
+                result['vlm_image_grid_thw'] = torch.cat(thw_list, dim=0)  # [N_total_images, 3]
 
     # ── Pre-computed VLM features (offline path) ──
     has_vlm = any('vlm_features' in s and s.get('vlm_features') is not None for s in batch)

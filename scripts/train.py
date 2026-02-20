@@ -79,7 +79,7 @@ class TrainConfig:
     dataset_weights: Optional[Dict[str, float]] = None  # None = temperature-balanced sampling
     image_size: int = 448
     cameras: List[str] = field(default_factory=lambda: ['front', 'wrist'])
-    data_fraction: float = 1.0            # 1.0 = full data, 0.1 = 10% per dataset
+    # (data_fraction removed — use prepare_data.py --max-episodes instead)
     
     # Training  
     batch_size: int = 16              # Per-GPU; effective = batch × n_gpu × grad_accum
@@ -92,12 +92,12 @@ class TrainConfig:
     
     # Loss
     loss_type: str = 'hybrid'       # 'pure_drift', 'mse', 'hybrid'
-    drift_weight: float = 0.1       # Weight for drifting loss in hybrid mode
+    drift_weight: float = 0.001     # Weight for raw drifting loss in hybrid mode
     temperatures: List[float] = field(default_factory=lambda: [0.02, 0.05, 0.2])
     n_pos_samples: int = 64
     n_neg_samples: int = 64
-    neg_queue_size: int = 2048
-    pos_queue_size: int = 256
+    neg_queue_size: int = 8192      # Single large global queue
+    pos_queue_size: int = 4096      # Single large global queue
     
     # EMA
     ema_decay: float = 0.9999
@@ -182,7 +182,8 @@ class DriftingVLATrainer:
         self.model = DriftingVLA(model_config).to(self.device)
         
         if self.distributed and not cfg.use_fsdp:
-            self.model = DDP(self.model, device_ids=[self.local_rank])
+            self.model = DDP(self.model, device_ids=[self.local_rank],
+                             find_unused_parameters=True)
         
         # EMA
         unwrapped = self.model.module if isinstance(self.model, DDP) else self.model
@@ -194,20 +195,19 @@ class DriftingVLATrainer:
             logger.info(f"Model: {total:,} params ({trainable:,} trainable)")
     
     def _load_vlm_processor(self):
-        """Load VLM processor for tokenization in DataLoader workers."""
+        """Load VLM processor for tokenization in DataLoader workers.
+        
+        This is REQUIRED for training — without it, batches will have no
+        VLM inputs and training will crash. Raises on failure.
+        """
         cfg = self.config
         from drifting_vla.models.vlm_backbone import VLM_SPECS
         hf_name = VLM_SPECS[cfg.vlm_model_key]['hf_name']
-        try:
-            from transformers import AutoProcessor
-            processor = AutoProcessor.from_pretrained(hf_name)
-            if self.is_main:
-                logger.info(f"Loaded VLM processor: {hf_name} (tokenization in DataLoader workers)")
-            return processor
-        except Exception as e:
-            if self.is_main:
-                logger.warning(f"Failed to load VLM processor: {e}. Falling back to in-forward tokenization.")
-            return None
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(hf_name)
+        if self.is_main:
+            logger.info(f"Loaded VLM processor: {hf_name}")
+        return processor
     
     def _build_datasets(self):
         """Build unified dataset from Episode HDF5 files.
@@ -220,8 +220,6 @@ class DriftingVLATrainer:
         episodes_root = Path(getattr(cfg, 'episodes_root', cfg.data_root + '/episodes'))
         
         datasets = {}
-        max_samples = getattr(cfg, 'max_samples_per_dataset', None)
-        data_fraction = getattr(cfg, 'data_fraction', 1.0)
         
         # Load VLM processor once for all datasets (tokenization in DataLoader)
         vlm_processor = self._load_vlm_processor()
@@ -240,21 +238,10 @@ class DriftingVLATrainer:
                     action_horizon=cfg.action_horizon,
                     num_history_frames=3,
                     image_size=cfg.image_size,
-                    max_samples=max_samples,
                     vlm_processor=vlm_processor,
+                    image_aug=getattr(cfg, 'image_aug', False),
+                    cond_mask_prob=getattr(cfg, 'cond_mask_prob', 0.1),
                 )
-                
-                # Apply data fraction: subsample to percentage of total
-                if 0.0 < data_fraction < 1.0 and len(ds) > 0:
-                    import random
-                    original_len = len(ds)
-                    target_len = max(1, int(original_len * data_fraction))
-                    if target_len < original_len:
-                        random.seed(42)  # Deterministic subsampling
-                        ds.sample_index = random.sample(ds.sample_index, target_len)
-                        if self.is_main:
-                            logger.info(f"  Data fraction {data_fraction:.0%}: "
-                                       f"{ds_name} {original_len} → {target_len} samples")
                 
                 if len(ds) > 0:
                     datasets[ds_name] = ds
@@ -273,8 +260,7 @@ class DriftingVLATrainer:
         if not datasets:
             raise RuntimeError(
                 "No datasets loaded! Run:\n"
-                "  python scripts/download_datasets.py --dataset <name> --n-samples 50\n"
-                "  python scripts/convert_to_episodes.py --dataset <name> --image-size 448"
+                "  python scripts/prepare_data.py --dataset <name>"
             )
         
         # VLM features directory
@@ -383,35 +369,29 @@ class DriftingVLATrainer:
         )
     
     def _build_queues(self):
-        """Build per-embodiment sample queues for drifting loss.
+        """Build single large global sample queues for drifting loss.
         
-        RDT-1B insight: mixed-embodiment queues produce noisy drift fields
-        because samples from different embodiments are orthogonal in the
-        128-dim space. Per-embodiment queues ensure pos/neg samples share
-        the same active dimensions.
+        The action mask zeros out inactive dims, so cross-embodiment samples
+        naturally have large L2 distance — the kernel exp(-||x-y||/τ) ≈ 0
+        between different embodiments. No explicit separation needed.
+        A single large queue fills faster and provides more diverse negatives.
         """
         cfg = self.config
+        # We store only active dims in the queue (compact representation)
+        # The max active dims across all embodiments is ~23*T for behavior1k
+        # But we use a fixed large dim and store the full masked-flat vectors
         action_flat_dim = cfg.action_horizon * UNIFIED_ACTION_DIM
         
-        # Per-embodiment queues (separate drift fields per action space)
-        from drifting_vla.data.action_mapping import EMBODIMENT_NAMES
-        self.pos_queues = {}
-        self.neg_queues = {}
-        for emb_id in EMBODIMENT_NAMES.keys():
-            self.pos_queues[emb_id] = GlobalSampleQueue(
+        self.pos_queue = GlobalSampleQueue(
             queue_size=cfg.pos_queue_size,
             action_dim=action_flat_dim,
             device=torch.device('cpu'),
         )
-            self.neg_queues[emb_id] = NegativeSampleQueue(
+        self.neg_queue = NegativeSampleQueue(
             queue_size=cfg.neg_queue_size,
             action_dim=action_flat_dim,
             device=torch.device('cpu'),
         )
-        
-        # Legacy aliases for backward compat
-        self.pos_queue = self.pos_queues.get(0)
-        self.neg_queue = self.neg_queues.get(0)
     
     def _init_wandb(self):
         """Initialize WandB logging with proper metric definitions."""
@@ -535,73 +515,41 @@ class DriftingVLATrainer:
                 metrics['mse_loss'] = mse_loss.item()
             
             if cfg.loss_type in ('pure_drift', 'hybrid'):
-                # Per-embodiment drifting loss — purely queue-driven
-                # Current batch pushes into queues; drift loss samples FROM queues.
-                # This avoids degenerate small-batch drift fields entirely.
-                pred_flat = actions_pred_masked.reshape(B, -1)
+                # Single global queue drifting loss
+                # The action mask zeros inactive dims, so cross-embodiment
+                # samples naturally separate via L2 distance in the kernel.
+                pred_flat = actions_pred_masked.reshape(B, -1)  # [B, T*128]
                 gt_flat = actions_gt_masked.reshape(B, -1)
                 
-                # Step 1: Push current batch into per-embodiment queues
-                unique_embs = embodiment_id.unique()
-                for emb_id_val in unique_embs:
-                    emb_key = emb_id_val.item()
-                    emb_mask = (embodiment_id == emb_id_val)
-                    if emb_mask.sum() == 0:
-                        continue
-                    pos_q = self.pos_queues.get(emb_key, self.pos_queues.get(0))
-                    neg_q = self.neg_queues.get(emb_key, self.neg_queues.get(0))
-                    neg_q.push(pred_flat[emb_mask].detach())
-                    pos_q.add(actions=gt_flat[emb_mask].detach())
+                # Push current batch into global queues
+                self.neg_queue.push(pred_flat.detach())
+                self.pos_queue.add(actions=gt_flat.detach())
                 
-                # Step 2: Compute drift loss per embodiment using QUEUES only
-                drift_losses = []
-                drift_norms = []
-                raw_drift_norms = []
-                lambda_Vs = []
+                # Compute drift loss when queues have enough samples
+                drift_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
                 loss_output = None
                 
-                for emb_id_val in unique_embs:
-                    emb_key = emb_id_val.item()
-                    emb_mask = (embodiment_id == emb_id_val)
-                    n_emb = emb_mask.sum().item()
-                    if n_emb == 0:
-                        continue
+                if (self.pos_queue.total_samples() >= cfg.n_pos_samples and
+                        self.neg_queue.count >= cfg.n_neg_samples):
                     
-                    pos_q = self.pos_queues.get(emb_key, self.pos_queues.get(0))
-                    neg_q = self.neg_queues.get(emb_key, self.neg_queues.get(0))
-                    
-                    # Only compute drift when queues have enough samples
-                    if pos_q.total_samples() < cfg.n_pos_samples or neg_q.count < cfg.n_neg_samples:
-                        continue
-                    
-                    pred_emb = pred_flat[emb_mask]
-                    pos_samples = pos_q.sample(cfg.n_pos_samples).to(self.device)
-                    neg_samples = neg_q.sample(cfg.n_neg_samples).to(self.device)
+                    pos_samples = self.pos_queue.sample(cfg.n_pos_samples).to(self.device)
+                    neg_samples = self.neg_queue.sample(cfg.n_neg_samples).to(self.device)
                     
                     try:
-                        loss_out = self.loss_fn(pred_emb, pos_samples, neg_samples)
+                        loss_out = self.loss_fn(pred_flat, pos_samples, neg_samples)
                         if torch.isfinite(loss_out.loss):
-                            drift_losses.append(loss_out.loss * n_emb / B)
-                            drift_norms.append(loss_out.drift_norm.item())
+                            # Use raw_drift_norm as loss (naturally → 0 at convergence)
+                            # instead of normalized loss (always ≈ 1.0)
+                            drift_loss = loss_out.raw_drift_norm if loss_out.raw_drift_norm is not None else loss_out.loss
+                            metrics['drift_loss'] = drift_loss.item()
+                            metrics['drift_norm'] = loss_out.drift_norm.item()
                             if loss_out.raw_drift_norm is not None:
-                                raw_drift_norms.append(loss_out.raw_drift_norm.item())
+                                metrics['raw_drift_norm'] = loss_out.raw_drift_norm.item()
                             if loss_out.lambda_V is not None:
-                                lambda_Vs.append(loss_out.lambda_V.item())
+                                metrics['lambda_V'] = loss_out.lambda_V.item()
                             loss_output = loss_out
                     except Exception:
                         pass
-                
-                # Aggregate
-                if drift_losses:
-                    drift_loss = sum(drift_losses)
-                    metrics['drift_loss'] = drift_loss.item()
-                    metrics['drift_norm'] = float(np.mean(drift_norms))
-                    if raw_drift_norms:
-                        metrics['raw_drift_norm'] = float(np.mean(raw_drift_norms))
-                    if lambda_Vs:
-                        metrics['lambda_V'] = float(np.mean(lambda_Vs))
-                else:
-                    drift_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
             
             # Combine losses
             if cfg.loss_type == 'mse':
@@ -659,13 +607,14 @@ class DriftingVLATrainer:
             logger.info(f"  Model: {cfg.model_size} ({cfg.hidden_dim}d, {cfg.num_layers}L)")
             logger.info(f"  VLM: {cfg.vlm_model_key}")
             logger.info(f"  Datasets: {cfg.datasets}")
-            logger.info(f"  Loss: {cfg.loss_type}")
-            logger.info(f"  Batch: {cfg.batch_size} × {cfg.grad_accumulation_steps} = {cfg.batch_size * cfg.grad_accumulation_steps}")
-            data_frac = getattr(cfg, 'data_fraction', 1.0)
-            if data_frac < 1.0:
-                logger.info(f"  Data: {data_frac:.0%} of total per dataset")
+            logger.info(f"  Loss: {cfg.loss_type} (drift_weight={cfg.drift_weight})")
+            n_gpus = dist.get_world_size() if dist.is_initialized() else 1
+            per_gpu = cfg.batch_size
+            accum = cfg.grad_accumulation_steps
+            global_batch = per_gpu * accum * n_gpus
+            logger.info(f"  Batch: {per_gpu}/gpu × {accum} accum × {n_gpus} GPUs = {global_batch} global")
             logger.info(f"  Steps: {cfg.max_steps}")
-            logger.info(f"  Device: {self.device}")
+            logger.info(f"  Device: {self.device} ({n_gpus} GPUs)")
             logger.info(f"{'='*60}")
         
         self.model.train()
@@ -1135,11 +1084,14 @@ def parse_args():
     parser.add_argument('--save-every', type=int, default=2000)
     parser.add_argument('--eval-every', type=int, default=500,
                         help='Run evaluation every N steps')
-    parser.add_argument('--max-samples', type=int, default=None,
-                        help='Max samples per dataset (e.g., 10000 for quick experiments)')
-    parser.add_argument('--data-fraction', type=float, default=1.0,
-                        help='Fraction of total data to use per dataset (0.0-1.0). '
-                             'E.g., 0.1 = use 10%% of each dataset for quick experiments.')
+    parser.add_argument('--num-workers', type=int, default=8,
+                        help='DataLoader workers (default 8)')
+    parser.add_argument('--eval-batches', type=int, default=50,
+                        help='Number of eval batches per evaluation run')
+    parser.add_argument('--image-aug', action='store_true', default=False,
+                        help='Enable image augmentation (ColorJitter)')
+    parser.add_argument('--cond-mask-prob', type=float, default=0.1,
+                        help='Condition masking probability for CFG training')
     
     return parser.parse_args()
 
@@ -1182,8 +1134,10 @@ def main():
     config.vlm_mode = args.vlm_mode
     config.lora_r = args.lora_r
     config.vlm_lr_scale = args.vlm_lr_scale
-    config.max_samples_per_dataset = args.max_samples
-    config.data_fraction = args.data_fraction
+    config.num_workers = args.num_workers
+    config.eval_batches = args.eval_batches
+    config.image_aug = args.image_aug
+    config.cond_mask_prob = args.cond_mask_prob
     
     # Model size configs
     size_cfgs = {

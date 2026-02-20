@@ -1,55 +1,286 @@
 """
-Unified Action Space Mapping (128-dim)
-========================================
+Unified Action Space Mapping — RDT-1B Compatible (128-dim)
+============================================================
 
-Non-overlapping regions for different action representations:
+Semantic named-field mapping where each physical quantity gets a named slot.
+A single robot can fill MULTIPLE regions simultaneously (e.g., joint AND EEF).
 
-  Region A: Single-arm EEF pose          [0:3]=xyz, [3:7]=quat, [7]=grip   (8 dims)
-  Region B: Single-arm joint positions   [8:15]=j0-j6, [15]=grip            (8 dims)
-  Region C: Bimanual joints              [16:23]=left_j0-j6, [23]=left_grip,
-                                         [24:31]=right_j0-j6, [31]=right_grip (16 dims)
-  Region D: Dexterous hand fingers       [32:48]=16 finger joints            (16 dims)
-  Region E: Extra / base                 [48:56]=base vel, etc.              (8 dims)
-  Padding:                               [56:127]=zeros                      (72 dims)
+Layout (RDT-1B compatible + Dex Hand extension):
+  [0, 10):   right arm joint positions
+  [10, 15):  right gripper joint positions
+  [15, 25):  right arm joint velocities
+  [25, 30):  right gripper joint velocities
+  [30, 33):  right EEF positions (xyz)
+  [33, 39):  right EEF 6D rotation (continuous, NOT quaternion)
+  [39, 42):  right EEF velocities
+  [42, 45):  right EEF angular velocities
+  [45, 50):  right dex finger joints (5 DOF)
+  [50, 60):  left arm joint positions
+  [60, 65):  left gripper joint positions
+  [65, 75):  left arm joint velocities
+  [75, 80):  left gripper joint velocities
+  [80, 83):  left EEF positions (xyz)
+  [83, 89):  left EEF 6D rotation
+  [89, 92):  left EEF velocities
+  [92, 95):  left EEF angular velocities
+  [95, 100): left dex finger joints (5 DOF)
+  [100, 103): base velocities (x, y, angular)
+  [103, 119): dexterous finger joints (16 DOF — DexWild, DexGraspNet)
+  [119, 128): reserved
 
-Embodiment → Region mapping:
-  Single-arm EEF     (rlbench, utaustin_mutex, stanford_hydra, cmu_stretch) → Region A
-  Single-arm Joint   (droid, bc_z, taco_play)                                → Region B
-  Bimanual           (aloha, nyu_franka)                                     → Region C
-  Bimanual + Mobile  (behavior1k R1Pro)                                      → Region C (16 arm) + Region E (7 base/torso)
-  Dexterous hand     (dexgraspnet)                                           → Region A (wrist) + D (fingers)
+References:
+  - RDT-1B: configs/state_vec.py
+  - 6D rotation: Zhou et al., CVPR 2019 "On the Continuity of Rotation Representations"
 """
 
 import numpy as np
 import torch
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, List
 from dataclasses import dataclass
 
 
 UNIFIED_ACTION_DIM = 128
 
-# ─── Region definitions (non-overlapping) ───
-REGION_EEF_START = 0        # Single-arm EEF: [0:8]
-REGION_EEF_END = 8
-REGION_JOINT_START = 8      # Single-arm joints: [8:16]
-REGION_JOINT_END = 16
-REGION_BIMANUAL_START = 16  # Bimanual: [16:32]
-REGION_BIMANUAL_END = 32
-REGION_HAND_START = 32      # Dex hand fingers: [32:48]
-REGION_HAND_END = 48
-REGION_EXTRA_START = 48     # Extra (base, etc): [48:56]
-REGION_EXTRA_END = 56
+# =============================================================================
+# Semantic State Vector Index Mapping (RDT-1B compatible + Dex Hand)
+# =============================================================================
 
-# Embodiment IDs
-EMBODIMENT_GRIPPER_EEF = 0       # Single arm, absolute EEF pose control
-EMBODIMENT_GRIPPER_JOINT = 1     # Single arm, joint position control
-EMBODIMENT_BIMANUAL = 2          # Two arms, joint control (≤16 dims)
-EMBODIMENT_DEXHAND = 3           # Dexterous hand (wrist EEF + finger joints)
-EMBODIMENT_GRIPPER_DELTA_EEF = 4 # Single arm, delta EEF control
-EMBODIMENT_BIMANUAL_MOBILE = 5   # Bimanual + base/torso (>16 dims, e.g. R1Pro 23-dim)
+STATE_VEC_IDX_MAPPING = {
+    # [0, 10): right arm joint positions
+    **{f'arm_joint_{i}_pos': i for i in range(10)},
+    **{f'right_arm_joint_{i}_pos': i for i in range(10)},
+    # [10, 15): right gripper joint positions
+    **{f'gripper_joint_{i}_pos': i + 10 for i in range(5)},
+    **{f'right_gripper_joint_{i}_pos': i + 10 for i in range(5)},
+    'gripper_open': 10,
+    'right_gripper_open': 10,
+    # [15, 25): right arm joint velocities
+    **{f'arm_joint_{i}_vel': i + 15 for i in range(10)},
+    **{f'right_arm_joint_{i}_vel': i + 15 for i in range(10)},
+    # [25, 30): right gripper joint velocities
+    **{f'gripper_joint_{i}_vel': i + 25 for i in range(5)},
+    **{f'right_gripper_joint_{i}_vel': i + 25 for i in range(5)},
+    'gripper_open_vel': 25,
+    # [30, 33): right EEF positions
+    'eef_pos_x': 30, 'right_eef_pos_x': 30,
+    'eef_pos_y': 31, 'right_eef_pos_y': 31,
+    'eef_pos_z': 32, 'right_eef_pos_z': 32,
+    # [33, 39): right EEF 6D rotation (continuous)
+    **{f'eef_angle_{i}': 33 + i for i in range(6)},
+    **{f'right_eef_angle_{i}': 33 + i for i in range(6)},
+    # [39, 42): right EEF velocities
+    'eef_vel_x': 39, 'eef_vel_y': 40, 'eef_vel_z': 41,
+    # [42, 45): right EEF angular velocities
+    'eef_angular_vel_roll': 42, 'eef_angular_vel_pitch': 43, 'eef_angular_vel_yaw': 44,
+    # [45, 50): right dex finger joints
+    **{f'right_finger_joint_{i}_pos': 45 + i for i in range(5)},
+    # [50, 60): left arm joint positions
+    **{f'left_arm_joint_{i}_pos': i + 50 for i in range(10)},
+    # [60, 65): left gripper joint positions
+    **{f'left_gripper_joint_{i}_pos': i + 60 for i in range(5)},
+    'left_gripper_open': 60,
+    # [65, 75): left arm joint velocities
+    **{f'left_arm_joint_{i}_vel': i + 65 for i in range(10)},
+    # [75, 80): left gripper joint velocities
+    **{f'left_gripper_joint_{i}_vel': i + 75 for i in range(5)},
+    # [80, 83): left EEF positions
+    'left_eef_pos_x': 80, 'left_eef_pos_y': 81, 'left_eef_pos_z': 82,
+    # [83, 89): left EEF 6D rotation
+    **{f'left_eef_angle_{i}': 83 + i for i in range(6)},
+    # [89, 92): left EEF velocities
+    'left_eef_vel_x': 89, 'left_eef_vel_y': 90, 'left_eef_vel_z': 91,
+    # [92, 95): left EEF angular velocities
+    'left_eef_angular_vel_roll': 92, 'left_eef_angular_vel_pitch': 93, 'left_eef_angular_vel_yaw': 94,
+    # [95, 100): left dex finger joints
+    **{f'left_finger_joint_{i}_pos': 95 + i for i in range(5)},
+    # [100, 103): base velocities
+    'base_vel_x': 100, 'base_vel_y': 101, 'base_angular_vel': 102,
+    # [103, 119): dexterous finger joints (DexWild 16-DOF, DexGraspNet)
+    **{f'dex_finger_joint_{i}_pos': 103 + i for i in range(16)},
+    # [119, 128): reserved
+}
 
-# Legacy alias
-EMBODIMENT_GRIPPER = 0
+
+# =============================================================================
+# 6D Rotation Conversion
+# =============================================================================
+
+def quaternion_to_6d_rotation(quat: np.ndarray) -> np.ndarray:
+    """Convert quaternion [x,y,z,w] to 6D continuous rotation.
+
+    Reference: Zhou et al., "On the Continuity of Rotation Representations
+    in Neural Networks", CVPR 2019.
+
+    Returns: [6] — first two columns of 3x3 rotation matrix, flattened.
+    """
+    from scipy.spatial.transform import Rotation
+    if np.linalg.norm(quat) < 1e-8:
+        return np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)  # identity
+    R = Rotation.from_quat(quat).as_matrix()  # [3, 3]
+    return R[:, :2].T.flatten().astype(np.float32)  # [6]
+
+
+def rotation_6d_to_quaternion(rot6d: np.ndarray) -> np.ndarray:
+    """Convert 6D rotation back to quaternion [x,y,z,w].
+
+    Reconstructs the third column via cross product, then converts.
+    """
+    from scipy.spatial.transform import Rotation
+    r6 = rot6d.reshape(2, 3)
+    # Gram-Schmidt orthogonalize
+    a1 = r6[0] / (np.linalg.norm(r6[0]) + 1e-8)
+    a2 = r6[1] - np.dot(a1, r6[1]) * a1
+    a2 = a2 / (np.linalg.norm(a2) + 1e-8)
+    a3 = np.cross(a1, a2)
+    R = np.stack([a1, a2, a3], axis=1)  # [3, 3]
+    return Rotation.from_matrix(R).as_quat().astype(np.float32)
+
+
+# =============================================================================
+# Per-Dataset Field Format Strings (maps native action dims to named fields)
+# =============================================================================
+
+DATASET_FIELD_FORMATS = {
+    'rlbench': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+        'gripper_open',
+    ],
+    'droid': [
+        'arm_joint_0_pos', 'arm_joint_1_pos', 'arm_joint_2_pos',
+        'arm_joint_3_pos', 'arm_joint_4_pos', 'arm_joint_5_pos',
+        'gripper_open',
+    ],
+    'bc_z': [
+        'arm_joint_0_pos', 'arm_joint_1_pos', 'arm_joint_2_pos',
+        'arm_joint_3_pos', 'arm_joint_4_pos', 'arm_joint_5_pos',
+        'gripper_open',
+    ],
+    'taco_play': [
+        'arm_joint_0_pos', 'arm_joint_1_pos', 'arm_joint_2_pos',
+        'arm_joint_3_pos', 'arm_joint_4_pos', 'arm_joint_5_pos',
+        'gripper_open',
+    ],
+    'utaustin_mutex': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2',
+        'gripper_open',
+    ],
+    'stanford_hydra': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2',
+        'gripper_open',
+    ],
+    'cmu_stretch': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2',
+        'gripper_open', 'base_vel_x',
+    ],
+    'aloha': [
+        'left_arm_joint_0_pos', 'left_arm_joint_1_pos', 'left_arm_joint_2_pos',
+        'left_arm_joint_3_pos', 'left_arm_joint_4_pos', 'left_arm_joint_5_pos',
+        'left_gripper_open',
+        'arm_joint_0_pos', 'arm_joint_1_pos', 'arm_joint_2_pos',
+        'arm_joint_3_pos', 'arm_joint_4_pos', 'arm_joint_5_pos',
+        'gripper_open',
+    ],
+    'nyu_franka': [
+        'left_arm_joint_0_pos', 'left_arm_joint_1_pos', 'left_arm_joint_2_pos',
+        'left_arm_joint_3_pos', 'left_arm_joint_4_pos', 'left_arm_joint_5_pos',
+        'left_gripper_open',
+        'arm_joint_0_pos', 'arm_joint_1_pos', 'arm_joint_2_pos',
+        'arm_joint_3_pos', 'arm_joint_4_pos', 'arm_joint_5_pos',
+        'gripper_open',
+        'base_vel_x',
+    ],
+    'dexgraspnet': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+        *[f'dex_finger_joint_{i}_pos' for i in range(16)],
+    ],
+    'dexwild': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+        *[f'dex_finger_joint_{i}_pos' for i in range(16)],
+    ],
+}
+
+# Behavior 1K: bimanual (8+8 arms) + base/torso (7)
+for _i in range(50):
+    DATASET_FIELD_FORMATS[f'behavior1k_t{_i:04d}'] = [
+        'left_arm_joint_0_pos', 'left_arm_joint_1_pos', 'left_arm_joint_2_pos',
+        'left_arm_joint_3_pos', 'left_arm_joint_4_pos', 'left_arm_joint_5_pos',
+        'left_arm_joint_6_pos', 'left_gripper_open',
+        'arm_joint_0_pos', 'arm_joint_1_pos', 'arm_joint_2_pos',
+        'arm_joint_3_pos', 'arm_joint_4_pos', 'arm_joint_5_pos',
+        'arm_joint_6_pos', 'gripper_open',
+        'base_vel_x', 'base_vel_y', 'base_angular_vel',
+        # remaining 4 dims: head/torso
+        'eef_vel_x', 'eef_vel_y', 'eef_vel_z', 'eef_angular_vel_roll',
+    ]
+
+
+# =============================================================================
+# assemble_state_vec — RDT-1B style named-field mapping
+# =============================================================================
+
+def assemble_state_vec(
+    values: np.ndarray,
+    field_names: List[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Map native action vector to 128-dim via named fields (RDT-1B style).
+
+    Args:
+        values: [D] native action vector
+        field_names: list of D field names from STATE_VEC_IDX_MAPPING
+
+    Returns:
+        (state_vec [128], mask_vec [128])
+    """
+    state_vec = np.zeros(UNIFIED_ACTION_DIM, dtype=np.float32)
+    mask_vec = np.zeros(UNIFIED_ACTION_DIM, dtype=np.float32)
+
+    for i, name in enumerate(field_names):
+        if i >= len(values):
+            break
+        if name in STATE_VEC_IDX_MAPPING:
+            idx = STATE_VEC_IDX_MAPPING[name]
+            state_vec[idx] = values[i]
+            mask_vec[idx] = 1.0
+
+    return state_vec, mask_vec
+
+
+def assemble_state_vec_batch(
+    actions: np.ndarray,
+    field_names: List[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Batch version: [T, D_native] → [T, 128] + [128] mask."""
+    T = actions.shape[0]
+    unified = np.zeros((T, UNIFIED_ACTION_DIM), dtype=np.float32)
+    mask = np.zeros(UNIFIED_ACTION_DIM, dtype=np.float32)
+
+    for i, name in enumerate(field_names):
+        if name in STATE_VEC_IDX_MAPPING:
+            idx = STATE_VEC_IDX_MAPPING[name]
+            if i < actions.shape[1]:
+                unified[:, idx] = actions[:, i]
+            mask[idx] = 1.0
+
+    return unified, mask
+
+
+# =============================================================================
+# Embodiment IDs (kept for backward compat)
+# =============================================================================
+
+EMBODIMENT_GRIPPER_EEF = 0
+EMBODIMENT_GRIPPER_JOINT = 1
+EMBODIMENT_BIMANUAL = 2
+EMBODIMENT_DEXHAND = 3
+EMBODIMENT_GRIPPER_DELTA_EEF = 4
+EMBODIMENT_BIMANUAL_MOBILE = 5
+EMBODIMENT_GRIPPER = 0  # legacy alias
 
 EMBODIMENT_NAMES = {
     0: 'gripper_eef',
@@ -60,31 +291,25 @@ EMBODIMENT_NAMES = {
     5: 'bimanual_mobile',
 }
 
-# ─── Dataset Registry ───
+# =============================================================================
+# Dataset Registry
+# =============================================================================
 
-# Dataset → Embodiment (determines which REGION is used)
 DATASET_EMBODIMENT = {
-    # Single-arm Absolute EEF → Region A [0:8]
     'rlbench': EMBODIMENT_GRIPPER_EEF,
-    # Single-arm Delta EEF → Region E [48:56]
     'utaustin_mutex': EMBODIMENT_GRIPPER_DELTA_EEF,
     'stanford_hydra': EMBODIMENT_GRIPPER_DELTA_EEF,
     'cmu_stretch': EMBODIMENT_GRIPPER_DELTA_EEF,
-    # Single-arm Joint → Region B [8:16]
     'droid': EMBODIMENT_GRIPPER_JOINT,
     'bc_z': EMBODIMENT_GRIPPER_JOINT,
     'taco_play': EMBODIMENT_GRIPPER_JOINT,
-    # Bimanual → Region C [16:32]
     'aloha': EMBODIMENT_BIMANUAL,
     'nyu_franka': EMBODIMENT_BIMANUAL,
-    # Bimanual + Mobile (R1Pro: 16 arm + 7 base/torso) → Region C + Region E
     **{f'behavior1k_t{i:04d}': EMBODIMENT_BIMANUAL_MOBILE for i in range(50)},
-    # Dexterous hand → Region A (wrist) + Region D (fingers)
     'dexgraspnet': EMBODIMENT_DEXHAND,
-    'dexwild': EMBODIMENT_DEXHAND,        # Real-world LEAP hand, 9.5K episodes, 5 tasks
+    'dexwild': EMBODIMENT_DEXHAND,
 }
 
-# HuggingFace repos
 DATASET_HF_REPOS = {
     'rlbench': 'hqfang/rlbench-18-tasks',
     'dexgraspnet': 'lhrlhr/DexGraspNet2.0',
@@ -97,7 +322,6 @@ DATASET_HF_REPOS = {
     'nyu_franka': 'lerobot/nyu_franka_play_dataset',
     'stanford_hydra': 'lerobot/stanford_hydra_dataset',
     **{f'behavior1k_t{i:04d}': f'lerobot/behavior1k-task{i:04d}' for i in range(50)},
-    # Dexterous hand datasets
     'dexwild': 'boardd/dexwild-dataset',
 }
 
@@ -109,19 +333,18 @@ LEROBOT_DATASETS = {
 }
 
 DATASET_NATIVE_ACTION_DIM = {
-    'rlbench': 8,           # EEF: xyz(3) + quat(4) + gripper(1)
-    'dexgraspnet': 23,      # EEF wrist(7) + finger joints(16)
-    'aloha': 14,            # Bimanual: left(7) + right(7) joint positions
-    'droid': 7,             # Joint: j0-j6 + gripper
-    'bc_z': 7,              # Joint: j0-j6 + gripper
-    'taco_play': 7,         # Joint: j0-j6 + gripper
-    'utaustin_mutex': 7,    # EEF: delta_xyz(3) + delta_rot(3) + gripper
-    'cmu_stretch': 8,       # EEF: delta_xyz(3) + delta_rot(3) + gripper + base
-    'nyu_franka': 15,       # Bimanual: left(7) + right(7) + extra
-    'stanford_hydra': 7,    # EEF: delta_xyz(3) + delta_rot(3) + gripper
+    'rlbench': 8,
+    'dexgraspnet': 23,
+    'aloha': 14,
+    'droid': 7,
+    'bc_z': 7,
+    'taco_play': 7,
+    'utaustin_mutex': 7,
+    'cmu_stretch': 8,
+    'nyu_franka': 15,
+    'stanford_hydra': 7,
     **{f'behavior1k_t{i:04d}': 23 for i in range(50)},
-    # Dexterous hand: wrist(7) + fingers(16) = 23 DOF
-    'dexwild': 23,    # LEAP hand v2: wrist_eef(7: xyz+quat) + finger_joints(16)
+    'dexwild': 23,
 }
 
 DATASET_ACTION_FORMAT = {
@@ -136,11 +359,13 @@ DATASET_ACTION_FORMAT = {
     'nyu_franka': 'absolute_joints',
     'stanford_hydra': 'delta_ee',
     **{f'behavior1k_t{i:04d}': 'absolute_joints' for i in range(50)},
-    'dexwild': 'absolute_ee',     # Wrist pose + finger joints
+    'dexwild': 'absolute_ee',
 }
 
 
-# ─── Action mask and mapping ───
+# =============================================================================
+# Action mask (derived from field format)
+# =============================================================================
 
 @dataclass
 class ActionMaskInfo:
@@ -151,148 +376,238 @@ class ActionMaskInfo:
     quat_dims: Optional[list]
 
 
-def get_action_mask(embodiment_id: int, native_dim: Optional[int] = None) -> ActionMaskInfo:
-    """Get the action mask for an embodiment type.
-    
-    Args:
-        embodiment_id: Which embodiment (determines which region).
-        native_dim: Actual number of native action dims for this dataset.
-            If provided, the mask is tightened to only cover exactly
-            native_dim positions within the region (no over-counting).
-            Example: aloha has native_dim=14 in bimanual region [16:32],
-            so only [16:30] is marked active (not the full [16:32]).
+def get_action_mask(embodiment_id: int, native_dim: Optional[int] = None,
+                    dataset_name: Optional[str] = None) -> ActionMaskInfo:
+    """Get the action mask for an embodiment/dataset.
+
+    If dataset_name is provided AND has a DATASET_FIELD_FORMATS entry,
+    the mask is computed from the named fields (precise).
+    Otherwise falls back to embodiment-based region logic (legacy).
     """
+    # ── New path: field-format-based mask ──
+    if dataset_name and dataset_name in DATASET_FIELD_FORMATS:
+        fields = DATASET_FIELD_FORMATS[dataset_name]
+        mask = np.zeros(UNIFIED_ACTION_DIM, dtype=bool)
+        for name in fields:
+            if name in STATE_VEC_IDX_MAPPING:
+                mask[STATE_VEC_IDX_MAPPING[name]] = True
+        active = int(mask.sum())
+        # Detect quaternion dims (legacy compat — [33:37] are rotation angles)
+        quat_dims = None
+        if any(f'eef_angle_{i}' in fields for i in range(4)):
+            quat_dims = [33, 34, 35, 36]
+        return ActionMaskInfo(mask=mask, active_dims=active,
+                              native_dim=native_dim or active, quat_dims=quat_dims)
+
+    # ── Legacy path: embodiment region-based ──
     mask = np.zeros(UNIFIED_ACTION_DIM, dtype=bool)
+    nd = native_dim or 8
 
     if embodiment_id == EMBODIMENT_GRIPPER_EEF:
-        # Region A: [0:8]
-        n = min(native_dim, 8) if native_dim else 8
-        mask[REGION_EEF_START:REGION_EEF_START + n] = True
-        quat_dims = [3, 4, 5, 6] if n >= 7 else None
-        return ActionMaskInfo(mask=mask, active_dims=n, native_dim=n, quat_dims=quat_dims)
+        n = min(nd, 8)
+        mask[30:30 + min(n, 3)] = True  # EEF pos
+        if n > 3:
+            mask[33:33 + min(n - 3, 4)] = True  # rotation
+        if n > 7:
+            mask[10] = True  # gripper_open
+        quat_dims = [33, 34, 35, 36] if n >= 7 else None
+        return ActionMaskInfo(mask=mask, active_dims=int(mask.sum()), native_dim=nd, quat_dims=quat_dims)
 
     elif embodiment_id == EMBODIMENT_GRIPPER_JOINT:
-        # Region B: [8:16]
-        n = min(native_dim, 8) if native_dim else 8
-        mask[REGION_JOINT_START:REGION_JOINT_START + n] = True
-        return ActionMaskInfo(mask=mask, active_dims=n, native_dim=n, quat_dims=None)
+        n = min(nd, 7)
+        mask[0:n] = True  # arm joints
+        if nd > 6:
+            mask[10] = True  # gripper_open
+        return ActionMaskInfo(mask=mask, active_dims=int(mask.sum()), native_dim=nd, quat_dims=None)
 
     elif embodiment_id == EMBODIMENT_BIMANUAL:
-        # Region C: [16:32]
-        n = min(native_dim, 16) if native_dim else 16
-        mask[REGION_BIMANUAL_START:REGION_BIMANUAL_START + n] = True
-        return ActionMaskInfo(mask=mask, active_dims=n, native_dim=n, quat_dims=None)
+        n = min(nd, 14)
+        n_left = min(n, 7)
+        mask[50:50 + min(n_left, 6)] = True
+        if n_left > 6:
+            mask[60] = True
+        if n > 7:
+            n_right = min(n - 7, 7)
+            mask[0:min(n_right, 6)] = True
+            if n_right > 6:
+                mask[10] = True
+        return ActionMaskInfo(mask=mask, active_dims=int(mask.sum()), native_dim=nd, quat_dims=None)
 
     elif embodiment_id == EMBODIMENT_DEXHAND:
-        # Region A [0:7] (wrist EEF) + Region D [32:48] (fingers)
-        n_wrist = 7
-        n_fingers = min(native_dim - 7, 16) if native_dim and native_dim > 7 else 16
-        mask[REGION_EEF_START:REGION_EEF_START + n_wrist] = True
-        mask[REGION_HAND_START:REGION_HAND_START + n_fingers] = True
-        total = n_wrist + n_fingers
-        return ActionMaskInfo(mask=mask, active_dims=total, native_dim=total, quat_dims=[3, 4, 5, 6])
+        mask[30:33] = True  # EEF pos
+        mask[33:37] = True  # rotation
+        n_fingers = min(nd - 7, 16) if nd > 7 else 16
+        mask[103:103 + n_fingers] = True  # dex fingers
+        return ActionMaskInfo(mask=mask, active_dims=int(mask.sum()), native_dim=nd,
+                              quat_dims=[33, 34, 35, 36])
 
     elif embodiment_id == EMBODIMENT_GRIPPER_DELTA_EEF:
-        # Region E [48:56] — delta EEF
-        n = min(native_dim, 8) if native_dim else 8
-        mask[REGION_EXTRA_START:REGION_EXTRA_START + n] = True
-        return ActionMaskInfo(mask=mask, active_dims=n, native_dim=n, quat_dims=None)
+        n = min(nd, 8)
+        mask[30:30 + min(n, 3)] = True
+        if n > 3:
+            mask[33:33 + min(n - 3, 3)] = True
+        if n > 6:
+            mask[10] = True
+        if n > 7:
+            mask[100] = True
+        return ActionMaskInfo(mask=mask, active_dims=int(mask.sum()), native_dim=nd, quat_dims=None)
 
     elif embodiment_id == EMBODIMENT_BIMANUAL_MOBILE:
-        # Region C [16:32] (bimanual arms) + Region E [48:55] (base/torso)
-        n_arms = 16
-        n_extra = min(native_dim - 16, 8) if native_dim and native_dim > 16 else 7
-        mask[REGION_BIMANUAL_START:REGION_BIMANUAL_START + n_arms] = True
-        mask[REGION_EXTRA_START:REGION_EXTRA_START + n_extra] = True
-        total = n_arms + n_extra
-        return ActionMaskInfo(mask=mask, active_dims=total, native_dim=total, quat_dims=None)
+        # Arms: left [50:58] + right [0:8]
+        mask[50:58] = True
+        mask[0:8] = True
+        # Base
+        mask[100:103] = True
+        # Extra
+        if nd > 19:
+            mask[39:39 + min(nd - 19, 4)] = True
+        return ActionMaskInfo(mask=mask, active_dims=int(mask.sum()), native_dim=nd, quat_dims=None)
 
     else:
         raise ValueError(f"Unknown embodiment_id: {embodiment_id}")
 
 
-def map_to_unified(action: np.ndarray, embodiment_id: int) -> np.ndarray:
-    """
-    Map native action to 128-dim unified space (non-overlapping regions).
+# =============================================================================
+# map_to_unified / extract_from_unified — uses field formats when available
+# =============================================================================
 
-    Region A [0:8]:   Single-arm EEF (xyz+quat+grip)
-    Region B [8:16]:  Single-arm joints (j0-j6+grip)
-    Region C [16:32]: Bimanual joints (left 8 + right 8)
-    Region D [32:48]: Dex hand fingers (16 joints)
+def map_to_unified(action: np.ndarray, embodiment_id: int,
+                   dataset_name: Optional[str] = None) -> np.ndarray:
+    """Map native action to 128-dim unified space.
+
+    If dataset_name has a DATASET_FIELD_FORMATS entry, uses named-field mapping.
+    Otherwise falls back to simple region slicing (legacy).
     """
     is_sequence = action.ndim == 2
     if not is_sequence:
         action = action[np.newaxis]
 
+    # ── New path: named-field mapping ──
+    if dataset_name and dataset_name in DATASET_FIELD_FORMATS:
+        fields = DATASET_FIELD_FORMATS[dataset_name]
+        unified, _ = assemble_state_vec_batch(action, fields)
+        return unified if is_sequence else unified[0]
+
+    # ── Legacy path: region slicing ──
     T = action.shape[0]
     D_native = action.shape[1]
     unified = np.zeros((T, UNIFIED_ACTION_DIM), dtype=np.float32)
 
     if embodiment_id == EMBODIMENT_GRIPPER_EEF:
-        # EEF datasets → Region A [0:8]
-        n = min(D_native, 8)
-        unified[:, REGION_EEF_START:REGION_EEF_START + n] = action[:, :n]
+        n = min(D_native, 3)
+        unified[:, 30:30 + n] = action[:, :n]
+        if D_native > 3:
+            n_rot = min(D_native - 3, 4)
+            unified[:, 33:33 + n_rot] = action[:, 3:3 + n_rot]
+        if D_native > 7:
+            unified[:, 10] = action[:, 7]
 
     elif embodiment_id == EMBODIMENT_GRIPPER_JOINT:
-        # Joint datasets → Region B [8:16]
-        n = min(D_native, 8)
-        unified[:, REGION_JOINT_START:REGION_JOINT_START + n] = action[:, :n]
+        n = min(D_native, 6)
+        unified[:, 0:n] = action[:, :n]
+        if D_native > 6:
+            unified[:, 10] = action[:, 6]
 
     elif embodiment_id == EMBODIMENT_BIMANUAL:
-        # Bimanual datasets → Region C [16:32]
-        n = min(D_native, 16)
-        unified[:, REGION_BIMANUAL_START:REGION_BIMANUAL_START + n] = action[:, :n]
+        n = min(D_native, 14)
+        n_left = min(n, 7)
+        unified[:, 50:50 + min(n_left, 6)] = action[:, :min(n_left, 6)]
+        if n_left > 6:
+            unified[:, 60] = action[:, 6]
+        if n > 7:
+            n_right = min(n - 7, 7)
+            unified[:, 0:min(n_right, 6)] = action[:, 7:7 + min(n_right, 6)]
+            if n_right > 6:
+                unified[:, 10] = action[:, 13]
 
     elif embodiment_id == EMBODIMENT_DEXHAND:
-        # Dex hand → Region A [0:7] (wrist) + Region D [32:48] (fingers)
         n_wrist = min(D_native, 7)
-        unified[:, REGION_EEF_START:REGION_EEF_START + n_wrist] = action[:, :n_wrist]
+        unified[:, 30:30 + min(n_wrist, 3)] = action[:, :min(n_wrist, 3)]
+        if n_wrist > 3:
+            unified[:, 33:33 + min(n_wrist - 3, 4)] = action[:, 3:n_wrist]
         if D_native > 7:
             n_fingers = min(D_native - 7, 16)
-            unified[:, REGION_HAND_START:REGION_HAND_START + n_fingers] = action[:, 7:7 + n_fingers]
+            unified[:, 103:103 + n_fingers] = action[:, 7:7 + n_fingers]
 
     elif embodiment_id == EMBODIMENT_GRIPPER_DELTA_EEF:
-        # Delta EEF → Region E [48:56]
-        n = min(D_native, 8)
-        unified[:, REGION_EXTRA_START:REGION_EXTRA_START + n] = action[:, :n]
+        n = min(D_native, 3)
+        unified[:, 30:30 + n] = action[:, :n]
+        if D_native > 3:
+            n_rot = min(D_native - 3, 3)
+            unified[:, 33:33 + n_rot] = action[:, 3:3 + n_rot]
+        if D_native > 6:
+            unified[:, 10] = action[:, 6]
+        if D_native > 7:
+            unified[:, 100] = action[:, 7]
 
     elif embodiment_id == EMBODIMENT_BIMANUAL_MOBILE:
-        # Bimanual mobile → Region C [16:32] (arms) + Region E [48:55] (base/torso)
-        # First 16 dims = bimanual arms
-        n_arms = min(D_native, 16)
-        unified[:, REGION_BIMANUAL_START:REGION_BIMANUAL_START + n_arms] = action[:, :n_arms]
-        # Remaining dims (17-23) = base/torso/head → Region E
+        # Left arm [50:58]
+        n_left = min(D_native, 8)
+        unified[:, 50:50 + n_left] = action[:, :n_left]
+        # Right arm [0:8]
+        if D_native > 8:
+            n_right = min(D_native - 8, 8)
+            unified[:, 0:n_right] = action[:, 8:8 + n_right]
+        # Base [100:103]
         if D_native > 16:
-            n_extra = min(D_native - 16, 7)
-            unified[:, REGION_EXTRA_START:REGION_EXTRA_START + n_extra] = action[:, 16:16 + n_extra]
+            n_base = min(D_native - 16, 3)
+            unified[:, 100:100 + n_base] = action[:, 16:16 + n_base]
+        # Extra
+        if D_native > 19:
+            n_extra = min(D_native - 19, 4)
+            unified[:, 39:39 + n_extra] = action[:, 19:19 + n_extra]
 
     if not is_sequence:
         return unified[0]
     return unified
 
 
-def extract_from_unified(unified: np.ndarray, embodiment_id: int) -> np.ndarray:
+def extract_from_unified(unified: np.ndarray, embodiment_id: int,
+                         dataset_name: Optional[str] = None) -> np.ndarray:
     """Extract native action from 128-dim unified space."""
     is_sequence = unified.ndim == 2
     if not is_sequence:
         unified = unified[np.newaxis]
 
+    if dataset_name and dataset_name in DATASET_FIELD_FORMATS:
+        fields = DATASET_FIELD_FORMATS[dataset_name]
+        T = unified.shape[0]
+        native = np.zeros((T, len(fields)), dtype=np.float32)
+        for i, name in enumerate(fields):
+            if name in STATE_VEC_IDX_MAPPING:
+                idx = STATE_VEC_IDX_MAPPING[name]
+                native[:, i] = unified[:, idx]
+        return native if is_sequence else native[0]
+
+    # Legacy extraction
     if embodiment_id == EMBODIMENT_GRIPPER_EEF:
-        action = unified[:, REGION_EEF_START:REGION_EEF_END]
+        pos = unified[:, 30:33]
+        rot = unified[:, 33:37]
+        grip = unified[:, 10:11]
+        action = np.concatenate([pos, rot, grip], axis=-1)
     elif embodiment_id == EMBODIMENT_GRIPPER_JOINT:
-        action = unified[:, REGION_JOINT_START:REGION_JOINT_END]
+        joints = unified[:, 0:6]
+        grip = unified[:, 10:11]
+        action = np.concatenate([joints, grip], axis=-1)
     elif embodiment_id == EMBODIMENT_BIMANUAL:
-        action = unified[:, REGION_BIMANUAL_START:REGION_BIMANUAL_END]
+        left = np.concatenate([unified[:, 50:56], unified[:, 60:61]], axis=-1)
+        right = np.concatenate([unified[:, 0:6], unified[:, 10:11]], axis=-1)
+        action = np.concatenate([left, right], axis=-1)
     elif embodiment_id == EMBODIMENT_DEXHAND:
-        wrist = unified[:, REGION_EEF_START:REGION_EEF_START + 7]
-        fingers = unified[:, REGION_HAND_START:REGION_HAND_END]
+        wrist = np.concatenate([unified[:, 30:33], unified[:, 33:37]], axis=-1)
+        fingers = unified[:, 103:119]
         action = np.concatenate([wrist, fingers], axis=-1)
     elif embodiment_id == EMBODIMENT_GRIPPER_DELTA_EEF:
-        action = unified[:, REGION_EXTRA_START:REGION_EXTRA_END]
+        pos = unified[:, 30:33]
+        rot = unified[:, 33:36]
+        grip = unified[:, 10:11]
+        action = np.concatenate([pos, rot, grip], axis=-1)
     elif embodiment_id == EMBODIMENT_BIMANUAL_MOBILE:
-        arms = unified[:, REGION_BIMANUAL_START:REGION_BIMANUAL_END]  # [T, 16]
-        extra = unified[:, REGION_EXTRA_START:REGION_EXTRA_START + 7]  # [T, 7]
-        action = np.concatenate([arms, extra], axis=-1)  # [T, 23]
+        left = unified[:, 50:58]
+        right = unified[:, 0:8]
+        base = unified[:, 100:103]
+        extra = unified[:, 39:43]
+        action = np.concatenate([left, right, base, extra], axis=-1)
     else:
         raise ValueError(f"Unknown embodiment_id: {embodiment_id}")
 
@@ -302,27 +617,22 @@ def extract_from_unified(unified: np.ndarray, embodiment_id: int) -> np.ndarray:
 
 
 def normalize_quaternion_in_unified(action: np.ndarray, embodiment_id: int) -> np.ndarray:
-    """Normalize quaternion dimensions in unified action."""
+    """Normalize rotation dimensions in unified action (legacy compat)."""
     info = get_action_mask(embodiment_id)
     if info.quat_dims is None:
         return action
-
     action = action.copy()
     if action.ndim == 1:
         quat = action[info.quat_dims]
         norm = np.linalg.norm(quat)
         if norm > 1e-6:
             action[info.quat_dims] = quat / norm
-        else:
-            action[info.quat_dims] = [0, 0, 0, 1]
     else:
         for t in range(action.shape[0]):
             quat = action[t, info.quat_dims]
             norm = np.linalg.norm(quat)
             if norm > 1e-6:
                 action[t, info.quat_dims] = quat / norm
-            else:
-                action[t, info.quat_dims] = [0, 0, 0, 1]
     return action
 
 
