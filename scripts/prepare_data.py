@@ -128,6 +128,11 @@ DATASETS = {
         'type': 'dexwild',
         'description': 'DexWild dexterous LEAP hand (95K, 22-dim dex)',
     },
+    'dexora': {
+        'hf_repo': 'Dexora/Dexora_Real-World_Dataset',
+        'type': 'lerobot',
+        'description': 'Dexora bimanual dexterous real-world (2.9M, 39-dim)',
+    },
 }
 
 # Add Behavior 1K tasks

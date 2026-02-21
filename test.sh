@@ -11,7 +11,6 @@
 #                      -e WANDB_API_KEY=$WANDB_API_KEY \
 #                      -it drifting-vla:pretrain bash test.sh
 # =============================================================================
-sleep 4h
 set -e
 
 # =============================================================================
@@ -22,9 +21,21 @@ set -e
 # --cleanup: free HF cache after each dataset
 # Automatically skips datasets with existing metadata.json
 
-# python scripts/prepare_data.py \
-#     --datasets bc_z taco_play \
-#     --parallel 2 --cleanup
+python scripts/prepare_data.py \
+    --datasets bc_z taco_play \
+    --parallel 2 --cleanup
+
+# LeRobot datasets
+python scripts/prepare_data.py --dataset droid --max-episodes 25 --force --cleanup
+python scripts/prepare_data.py --dataset utaustin_mutex --max-episodes 25 --force --cleanup
+python scripts/prepare_data.py --dataset nyu_franka --max-episodes 25 --force --cleanup
+python scripts/prepare_data.py --dataset behavior1k_t0000 --max-episodes 25 --force --cleanup
+python scripts/prepare_data.py --dataset dexora --max-episodes 25 --force --cleanup
+
+# Non-LeRobot datasets (special handlers)
+python scripts/prepare_data.py --dataset rlbench --max-episodes 25 --force --cleanup
+python scripts/prepare_data.py --dataset dexgraspnet --max-episodes 25 --force --cleanup
+python scripts/prepare_data.py --dataset dexwild --max-episodes 25 --force --cleanup
 
 # =============================================================================
 # Step 2: 8-GPU Training (5 datasets, 3 embodiment types)

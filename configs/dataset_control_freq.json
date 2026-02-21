@@ -10,6 +10,7 @@
     "stanford_hydra": 10,
     "dexgraspnet": 1,
     "dexwild": 30,
+    "dexora": 20,
     "behavior1k_t0000": 30
 }
 

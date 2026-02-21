@@ -14,7 +14,7 @@ Layout (RDT-1B compatible + Dex Hand extension):
   [33, 39):  right EEF 6D rotation (continuous, NOT quaternion)
   [39, 42):  right EEF velocities
   [42, 45):  right EEF angular velocities
-  [45, 50):  right dex finger joints (5 DOF)
+  [45, 50):  head/torso/spine joints + reserved  (RDT-1B: reserved)
   [50, 60):  left arm joint positions
   [60, 65):  left gripper joint positions
   [65, 75):  left arm joint velocities
@@ -23,10 +23,11 @@ Layout (RDT-1B compatible + Dex Hand extension):
   [83, 89):  left EEF 6D rotation
   [89, 92):  left EEF velocities
   [92, 95):  left EEF angular velocities
-  [95, 100): left dex finger joints (5 DOF)
+  [95, 100): reserved (RDT-1B compatible)
   [100, 103): base velocities (x, y, angular)
-  [103, 119): dexterous finger joints (16 DOF — DexWild, DexGraspNet)
-  [119, 128): reserved
+  [103, 115): right dexterous finger joints (12 DOF max)
+  [115, 127): left dexterous finger joints (12 DOF max)
+  [127, 128): reserved
 
 References:
   - RDT-1B: configs/state_vec.py
@@ -72,8 +73,8 @@ STATE_VEC_IDX_MAPPING = {
     'eef_vel_x': 39, 'eef_vel_y': 40, 'eef_vel_z': 41,
     # [42, 45): right EEF angular velocities
     'eef_angular_vel_roll': 42, 'eef_angular_vel_pitch': 43, 'eef_angular_vel_yaw': 44,
-    # [45, 50): right dex finger joints
-    **{f'right_finger_joint_{i}_pos': 45 + i for i in range(5)},
+    # [45, 50): head/torso/spine joints (reserved in RDT-1B, extended for Dexora-class robots)
+    'head_joint_0': 45, 'head_joint_1': 46, 'spine_joint': 47,
     # [50, 60): left arm joint positions
     **{f'left_arm_joint_{i}_pos': i + 50 for i in range(10)},
     # [60, 65): left gripper joint positions
@@ -91,13 +92,15 @@ STATE_VEC_IDX_MAPPING = {
     'left_eef_vel_x': 89, 'left_eef_vel_y': 90, 'left_eef_vel_z': 91,
     # [92, 95): left EEF angular velocities
     'left_eef_angular_vel_roll': 92, 'left_eef_angular_vel_pitch': 93, 'left_eef_angular_vel_yaw': 94,
-    # [95, 100): left dex finger joints
-    **{f'left_finger_joint_{i}_pos': 95 + i for i in range(5)},
+    # [95, 100): reserved (RDT-1B compatible)
     # [100, 103): base velocities
     'base_vel_x': 100, 'base_vel_y': 101, 'base_angular_vel': 102,
-    # [103, 119): dexterous finger joints (DexWild 16-DOF, DexGraspNet)
-    **{f'dex_finger_joint_{i}_pos': 103 + i for i in range(16)},
-    # [119, 128): reserved
+    # [103, 115): right dexterous finger joints (12 DOF max)
+    # [115, 127): left dexterous finger joints (12 DOF max)
+    # Single-hand datasets (DexWild 16-DOF) use dex_finger_joint_{0-15} → [103:119]
+    # Bimanual dex (Dexora 12+12) uses right {0-11} → [103:115], left {12-23} → [115:127]
+    **{f'dex_finger_joint_{i}_pos': 103 + i for i in range(24)},
+    # [127, 128): reserved
 }
 
 
@@ -203,6 +206,18 @@ DATASET_FIELD_FORMATS = {
         'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
         *[f'dex_finger_joint_{i}_pos' for i in range(16)],
     ],
+    'dexora': [
+        # Left arm joints [50:56]
+        *[f'left_arm_joint_{i}_pos' for i in range(6)],
+        # Right arm joints [0:6]
+        *[f'arm_joint_{i}_pos' for i in range(6)],
+        # Left hand 12 finger joints [115:127]
+        *[f'dex_finger_joint_{12+i}_pos' for i in range(12)],
+        # Right hand 12 finger joints [103:115]
+        *[f'dex_finger_joint_{i}_pos' for i in range(12)],
+        # Head + spine [45:48]
+        'head_joint_0', 'head_joint_1', 'spine_joint',
+    ],
 }
 
 # Behavior 1K: bimanual (8+8 arms) + base/torso (7)
@@ -280,6 +295,7 @@ EMBODIMENT_BIMANUAL = 2
 EMBODIMENT_DEXHAND = 3
 EMBODIMENT_GRIPPER_DELTA_EEF = 4
 EMBODIMENT_BIMANUAL_MOBILE = 5
+EMBODIMENT_BIMANUAL_DEX = 6       # Bimanual + dexterous hands (Dexora-class)
 EMBODIMENT_GRIPPER = 0  # legacy alias
 
 EMBODIMENT_NAMES = {
@@ -289,6 +305,7 @@ EMBODIMENT_NAMES = {
     3: 'dex_hand',
     4: 'gripper_delta_eef',
     5: 'bimanual_mobile',
+    6: 'bimanual_dex',
 }
 
 # =============================================================================
@@ -308,6 +325,7 @@ DATASET_EMBODIMENT = {
     **{f'behavior1k_t{i:04d}': EMBODIMENT_BIMANUAL_MOBILE for i in range(50)},
     'dexgraspnet': EMBODIMENT_DEXHAND,
     'dexwild': EMBODIMENT_DEXHAND,
+    'dexora': EMBODIMENT_BIMANUAL_DEX,
 }
 
 DATASET_HF_REPOS = {
@@ -323,6 +341,7 @@ DATASET_HF_REPOS = {
     'stanford_hydra': 'lerobot/stanford_hydra_dataset',
     **{f'behavior1k_t{i:04d}': f'lerobot/behavior1k-task{i:04d}' for i in range(50)},
     'dexwild': 'boardd/dexwild-dataset',
+    'dexora': 'Dexora/Dexora_Real-World_Dataset',
 }
 
 LEROBOT_DATASETS = {
@@ -330,6 +349,7 @@ LEROBOT_DATASETS = {
     'taco_play', 'utaustin_mutex', 'cmu_stretch',
     'nyu_franka', 'stanford_hydra',
     *{f'behavior1k_t{i:04d}' for i in range(50)},
+    'dexora',
 }
 
 DATASET_NATIVE_ACTION_DIM = {
@@ -345,6 +365,7 @@ DATASET_NATIVE_ACTION_DIM = {
     'stanford_hydra': 7,
     **{f'behavior1k_t{i:04d}': 23 for i in range(50)},
     'dexwild': 23,
+    'dexora': 39,
 }
 
 DATASET_ACTION_FORMAT = {
@@ -360,6 +381,7 @@ DATASET_ACTION_FORMAT = {
     'stanford_hydra': 'delta_ee',
     **{f'behavior1k_t{i:04d}': 'absolute_joints' for i in range(50)},
     'dexwild': 'absolute_ee',
+    'dexora': 'absolute_joints',
 }
 
 
