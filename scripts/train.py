@@ -181,11 +181,16 @@ class DriftingVLATrainer:
         
         self.model = DriftingVLA(model_config).to(self.device)
         
+        # Load VLM eagerly (before DDP + EMA) so LoRA params are in place
+        # Otherwise EMA snapshots pre-LoRA shapes → size mismatch on update
+        if vlm_use_lora or vlm_mode != 'frozen':
+            self.model.vlm_backbone.load_vlm(self.device)
+        
         if self.distributed and not cfg.use_fsdp:
             self.model = DDP(self.model, device_ids=[self.local_rank],
                              find_unused_parameters=True)
         
-        # EMA
+        # EMA (must be after VLM+LoRA loading so param shapes match)
         unwrapped = self.model.module if isinstance(self.model, DDP) else self.model
         self.ema = EMA(unwrapped, decay=cfg.ema_decay)
         

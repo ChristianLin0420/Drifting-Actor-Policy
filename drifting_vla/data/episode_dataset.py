@@ -161,22 +161,35 @@ class EpisodeHDF5Dataset(Dataset):
         return len(self.sample_index)
 
     def __getitem__(self, idx: int) -> dict:
-        """Load a sample from HDF5 + optionally preprocess for VLM ViT encoder."""
-        ep_file, t_start = self.sample_index[idx]
+        """Load a sample from HDF5 + preprocess for VLM ViT encoder.
+        
+        On failure, retries with random replacement samples (up to 5 attempts).
+        This ensures every sample in a batch has valid VLM keys — no dummies.
+        Same retry pattern used by RDT-1B, Octo, and OpenVLA.
+        """
+        import random as _random
+        for _attempt in range(5):
+            try:
+                ep_file, t_start = self.sample_index[idx]
+                f = self._get_file(ep_file)
 
-        try:
-            f = self._get_file(ep_file)
+                if self.is_static:
+                    sample = self._load_static(f, t_start, idx)
+                else:
+                    sample = self._load_temporal(f, t_start, idx)
 
-            if self.is_static:
-                sample = self._load_static(f, t_start, idx)
-            else:
-                sample = self._load_temporal(f, t_start, idx)
+                return self._preprocess_vlm(sample)
+            except Exception as e:
+                if _attempt == 0:
+                    logger.warning(f"Error loading sample {idx}: {e}")
+                idx = _random.randint(0, len(self.sample_index) - 1)
 
-            # Preprocess for VLM ViT encoder in DataLoader worker (parallel)
-            return self._preprocess_vlm(sample)
-        except Exception as e:
-            logger.warning(f"Error loading sample {idx} from {ep_file}: {e}")
-            return self._empty_sample()
+        # All retries failed — last resort: return first sample in dataset
+        logger.error(f"All 5 retry attempts failed, falling back to sample 0")
+        ep_file, t_start = self.sample_index[0]
+        f = self._get_file(ep_file)
+        sample = self._load_temporal(f, t_start, 0) if not self.is_static else self._load_static(f, t_start, 0)
+        return self._preprocess_vlm(sample)
 
     def _load_temporal(self, f: h5py.File, t_start: int, idx: int) -> dict:
         """Load temporal episode sample."""

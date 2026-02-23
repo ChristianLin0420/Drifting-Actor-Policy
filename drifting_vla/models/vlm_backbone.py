@@ -49,7 +49,7 @@ class VLMConfig:
     lora_alpha: int = 32                  # LoRA scaling factor
     lora_dropout: float = 0.05
     lora_target_modules: List[str] = field(default_factory=lambda: [
-        "q_proj", "v_proj",               # ViT attention
+        "qkv", "proj",                    # Qwen3-VL ViT uses fused qkv + proj
     ])
 
 
