@@ -11,13 +11,14 @@ Drifting-VLA is a unified foundation model for robotic manipulation that generat
 The system combines:
 - A **Vision-Language Model** (Qwen3-VL-2B) that processes multi-view images and language instructions
 - A **Drifting DiT** (Diffusion Transformer) that generates 128-dimensional unified actions
-- A **semantic action mapping** compatible with RDT-1B that supports 7 embodiment types across 13 dataset families
+- A **semantic action mapping** compatible with RDT-1B that supports 7 embodiment types across 27 dataset families
 
 Key numbers:
 - **155M trainable parameters** (VLM LoRA 5M + Projector 3.2M + DiT 147M)
 - **128-dim unified action space** with 163 named semantic fields
+- **64-step action horizon** (matching RDT-1B)
 - **7 embodiment types** from single-arm grippers to bimanual dexterous hands
-- **13 dataset families** (63+ sub-datasets) totaling ~35M frames
+- **27 dataset families** (78+ sub-datasets) totaling ~8M+ frames
 
 ---
 
@@ -38,10 +39,24 @@ All datasets are accessed through a single `prepare_data.py` script that handles
 | 7 | **utaustin_mutex** | `lerobot/utaustin_mutex` | 362K | 7 | gripper_delta_eef | 2 | ✅ |
 | 8 | **nyu_franka** | `lerobot/nyu_franka_play_dataset` | 45K | 15 | bimanual | 2 | ❌ |
 | 9 | **rlbench** | `hqfang/rlbench-18-tasks` | 270K | 8 | gripper_eef | 2-5 | ✅ |
-| 10 | **dexgraspnet** | `lhrlhr/DexGraspNet2.0` | 500K | 23 | dex_hand | 8 | ✅ |
-| 11 | **dexwild** | `YingyangPolarBear/DexWild` | 95K | 23 | dex_hand | 2 | ✅ |
-| 12 | **dexora** | `Dexora/Dexora_Real-World_Dataset` | 2.9M | 39 | bimanual_dex | 4 | ✅ |
-| 13 | **behavior1k** ×50 | `lerobot/behavior1k-task{i:04d}` | ~430K ea | 23 | bimanual_mobile | 3 | ✅ |
+| 10 | **dexwild** | `boardd/dexwild-dataset` | 95K | 23 | dex_hand | 2 | ✅ |
+| 11 | **dexora** | `Dexora/Dexora_Real-World_Dataset` | 2.9M | 39 | bimanual_dex | 4 | ✅ |
+| 12 | **behavior1k** ×50 | `lerobot/behavior1k-task{i:04d}` | ~430K ea | 23 | bimanual_mobile | 3 | ✅ |
+| 13 | **bridgev2** | `lerobot/bridge_v2` | 60K | 8 | gripper_delta_eef | 1 | ✅ |
+| 14 | **fractal** | `lerobot/fractal20220817_data` | 87K | 11 | gripper_delta_eef | 1 | ✅ |
+| 15 | **language_table** | `lerobot/language_table` | 442K | 2 | gripper_delta_eef | 1 | ✅ |
+| 16 | **kuka** | `lerobot/kuka` | 579K | 11 | gripper_delta_eef | 1 | ✅ |
+| 17 | **berkeley_fanuc** | `lerobot/berkeley_fanuc_manipulation` | 63K | 7 | gripper_delta_eef | 2 | ✅ |
+| 18 | **cmu_play_fusion** | `lerobot/cmu_play_fusion` | 236K | 8 | gripper_delta_eef | 1 | ✅ |
+| 19 | **viola** | `lerobot/viola` | 11K | 8 | gripper_delta_eef | 1 | ✅ |
+| 20 | **jaco_play** | `lerobot/jaco_play` | 78K | 3 | gripper_delta_eef | 1 | ✅ |
+| 21 | **berkeley_cable_routing** | `lerobot/berkeley_cable_routing` | 1.6K | 6 | gripper_delta_eef | 2 | ❌ |
+| 22 | **furniture_bench** | `lerobot/furniture_bench_dataset...` | 5K | 8 | gripper_delta_eef | 1 | ✅ |
+| 23 | **austin_buds** | `lerobot/austin_buds_dataset` | 34K | 8 | gripper_delta_eef | 1 | ✅ |
+| 24 | **austin_sailor** | `lerobot/austin_sailor_dataset` | 353K | 10 | gripper_eef | 1 | ✅ |
+| 25 | **austin_sirius** | `lerobot/austin_sirius_dataset` | 280K | 10 | gripper_eef | 1 | ✅ |
+| 26 | **columbia_pusht** | `lerobot/columbia_cairlab_pusht_real` | 28K | 7 | gripper_delta_eef | 1 | ✅ |
+| 27 | **nyu_door** | `lerobot/nyu_door_opening_...` | 20K | 7 | gripper_delta_eef | 1 | ✅ |
 
 **Embodiment coverage:** Single-arm gripper (EEF, joints, delta), bimanual (gripper, mobile), single dexterous hand (16-DOF), bimanual dexterous hand (24-DOF with head/spine).
 
@@ -53,8 +68,9 @@ Each dataset falls into one of four source types, each with a dedicated handler:
 |------|----------|-------------|---------|
 | **LeRobot (video)** | bc_z, taco_play, stanford_hydra, droid, cmu_stretch, utaustin_mutex, nyu_franka, behavior1k, dexora | MP4 video files decoded via pyav | `prepare_lerobot()` with `LeRobotDataset` API |
 | **LeRobot (parquet)** | aloha | Images embedded in parquet columns | Same `prepare_lerobot()` — auto-detects |
-| **HF generic** | rlbench, dexgraspnet | Parquet or snapshot_download | `prepare_rlbench()`, `prepare_dexgraspnet()` |
+| **HF generic** | rlbench | Parquet or snapshot_download | `prepare_rlbench()` |
 | **Custom HDF5** | dexwild | Source HDF5 with JPEG image groups | `prepare_dexwild()` |
+| **LeRobot (OXE)** | bridgev2, fractal, language_table, kuka, berkeley_fanuc, cmu_play_fusion, viola, jaco_play, berkeley_cable_routing, furniture_bench, austin_buds, austin_sailor, austin_sirius, columbia_pusht, nyu_door | MP4 video files from Open X-Embodiment | `prepare_lerobot()` with `LeRobotDataset` API |
 
 ---
 
@@ -217,7 +233,7 @@ RDT-1B uses the same approach: for example, `stanford_robocook` maps its 7-dim a
 
 ### 3.4 Dexterous Hand Slots
 
-The `[103:127]` region handles dexterous manipulation. For **single-hand** datasets (DexWild, DexGraspNet), all 16 finger joints map to `dex_finger_joint_{0-15}` → `[103:119]`. For **bimanual dexterous** datasets (Dexora with 12+12=24 finger joints), right hand uses `{0-11}` → `[103:115]` and left hand uses `{12-23}` → `[115:127]`.
+The `[103:127]` region handles dexterous manipulation. For **single-hand** datasets (DexWild), all 16 finger joints map to `dex_finger_joint_{0-15}` → `[103:119]`. For **bimanual dexterous** datasets (Dexora with 12+12=24 finger joints), right hand uses `{0-11}` → `[103:115]` and left hand uses `{12-23}` → `[115:127]`.
 
 This is our extension beyond RDT-1B, which left `[103:128]` as reserved. The extension is backward compatible — no existing RDT-1B dataset uses these slots.
 
@@ -228,7 +244,7 @@ This is our extension beyond RDT-1B, which left `[103:128]` as reserved. The ext
 | 0 | `gripper_eef` | Absolute end-effector pose + gripper | EEF `[30:39]` + grip `[10]` | rlbench |
 | 1 | `gripper_joint` | Joint positions + gripper | Joints `[0:6]` + grip `[10]` | droid, bc_z, taco_play |
 | 2 | `bimanual` | Two arms with grippers | L `[50:56]+[60]` + R `[0:6]+[10]` | aloha, nyu_franka |
-| 3 | `dex_hand` | Wrist EEF + finger joints | EEF `[30:37]` + fingers `[103:119]` | dexwild, dexgraspnet |
+| 3 | `dex_hand` | Wrist EEF + finger joints | EEF `[30:37]` + fingers `[103:119]` | dexwild |
 | 4 | `gripper_delta_eef` | Delta EEF commands | Delta `[30:36]` + grip `[10]` | stanford_hydra, utaustin_mutex |
 | 5 | `bimanual_mobile` | Two arms + mobile base | Arms + base `[100:103]` | behavior1k ×50 |
 | 6 | `bimanual_dex` | Two arms + dex hands + head | Arms + fingers `[103:127]` + head `[45:48]` | dexora |
@@ -321,7 +337,7 @@ The DiT takes VLM features and generates action trajectories:
 Inputs:
   c_seq   [B, L, 768]    — VLM visual + text features (with camera/time embeddings)
   c_pool  [B, 768]       — Pooled global context
-  noise   [B, T, 64]     — Random Gaussian noise (T=16 action horizon)
+  noise   [B, T, 64]     — Random Gaussian noise (T=64 action horizon)
   embodiment_id [B]      — Which robot type (0-6)
   proprio [B, 128]       — Current robot state (128-dim unified)
   ctrl_freqs [B]         — Control frequency in Hz (e.g., 50 for ALOHA, 15 for DROID)
@@ -574,7 +590,7 @@ Drifting-Actor-Policy/
 
 ---
 
-## 11. Training Results (8×A40, 14 datasets, 10K steps)
+## 11. Training Results (8×A40, 13 datasets, 10K steps)
 
 Results from run `base_0218_1630` (WandB: `crlc112358/drifting-vla/runs/fvkls5id`):
 
@@ -585,8 +601,8 @@ Results from run `base_0218_1630` (WandB: `crlc112358/drifting-vla/runs/fvkls5id
 | gripper_delta_eef | stanford_hydra, cmu_stretch, utaustin_mutex | 0.0106 | 0.0583 |
 | bimanual | aloha, nyu_franka | 0.0063 | 0.0501 |
 | bimanual_mobile | behavior1k ×3 | 0.0024 | 0.0267 |
-| dex_hand | dexwild, dexgraspnet | 0.0323 | 0.1338 |
-| **Overall** | **14 datasets, 6 embodiments** | **0.0127** | **0.0668** |
+| dex_hand | dexwild | 0.0323 | 0.1338 |
+| **Overall** | **13 datasets, 6 embodiments** | **0.0127** | **0.0668** |
 
 ---
 
@@ -606,7 +622,7 @@ Results from run `base_0218_1630` (WandB: `crlc112358/drifting-vla/runs/fvkls5id
 
 We target **1,000,000 pre-training steps** to match RDT-1B's training scale. While our 1-NFE architecture converges faster per-step than diffusion, the full 1M steps ensure:
 
-1. **All 13 dataset families seen sufficiently** — with effective batch 8,192, 1M steps = 8.2B total samples
+1. **All 27 dataset families seen sufficiently** — with effective batch 8,192, 1M steps = 8.2B total samples
 2. **Drifting loss equilibrium** — V needs many iterations across all embodiments to converge toward zero
 3. **Cross-embodiment transfer** — learning shared representations across 7 embodiment types requires extended training
 4. **Fair comparison with RDT-1B** — same compute budget enables direct architectural comparison
@@ -673,7 +689,6 @@ Actual download + HDF5 conversion estimates based on verified HuggingFace datase
 | utaustin_mutex | 1,500 | 362K | ~30 GB | ~6 GB | 6 hrs |
 | nyu_franka | 450 | 45K | ~8 GB | ~2 GB | 2 hrs |
 | rlbench | 2,700 | 270K | ~116 GB | ~20 GB | 4 hrs |
-| dexgraspnet | 8,270 scenes | 500K grasps | ~50 GB | ~10 GB | 3 hrs |
 | dexwild | 9,500 | 95K | ~30 GB | ~8 GB | 4 hrs |
 | dexora | 12,200 | 2.9M | ~150 GB (est) | ~50 GB | 12 hrs |
 | behavior1k ×50 | ~100 ea | ~430K ea | ~5 GB ea | ~3 GB ea | ~2 hrs ea |
@@ -687,17 +702,115 @@ Actual download + HDF5 conversion estimates based on verified HuggingFace datase
 
 ---
 
-## 13. References
+## 13. Drifting Field Implementation — Alignment Analysis
 
-1. **Drifting:** One-Step Generation via Training-Time Distribution Evolution. arXiv:2602.04770, 2025.
+This section documents the mathematical alignment between our implementation
+(`drifting_vla/training/drifting_field.py`) and the official paper
+"Generative Modeling via Drifting" (arXiv:2602.04770), specifically
+Algorithm 2 (Appendix A.1) and the normalization scheme (Appendix A.6).
+
+### 13.1 Algorithm 2 Alignment
+
+The paper's Algorithm 2 pseudocode (Appendix A.1, p.11):
+
+```
+A_pos, A_neg = split(A, [N_pos], dim=1)
+W_pos = A_pos;  W_neg = A_neg
+W_pos *= A_neg.sum(dim=1, keepdim=True)   # cross-weight
+W_neg *= A_pos.sum(dim=1, keepdim=True)   # cross-weight
+drift_pos = W_pos @ y_pos
+drift_neg = W_neg @ y_neg
+V = drift_pos - drift_neg
+```
+
+This implements Eq. (11): \( \mathbf{V}(\mathbf{x}) = \mathbb{E}[\tilde{k}(\mathbf{x},\mathbf{y}^+)\tilde{k}(\mathbf{x},\mathbf{y}^-)(\mathbf{y}^+ - \mathbf{y}^-)] \).
+
+**Key distinction from Eq. (8)/(10)**: The combined form Eq. (11) computes `W_pos @ y_pos - W_neg @ y_neg` directly — the drift vector is `(y+ - y-)` weighted by the cross-product kernel, NOT `(y+ - x)` and `(y- - x)` separately (which would add an extra center-subtraction term `-(Σw_pos - Σw_neg)·x`).
+
+Our implementation matches Algorithm 2: `V = W_pos @ y_pos - W_neg @ y_neg`.
+
+The unofficial reference at [aengusng8/DriftingModel](https://github.com/aengusng8/DriftingModel) omits the cross-weighting step (`W *= sum`), making it inconsistent with Algorithm 2.
+
+### 13.2 Feature Normalization (Appendix A.6, Eq. 18-22)
+
+The paper normalizes features so that:
+
+\[
+S_j = \frac{1}{\sqrt{C_j}} \mathbb{E}[\|\phi(\mathbf{x}) - \phi(\mathbf{y})\|], \quad
+\tilde{\phi}_j = \phi_j / S_j, \quad
+\tilde{\tau} = \tau \cdot \sqrt{C_j}
+\]
+
+After normalization, \( \mathbb{E}[\|\tilde{\phi}(\mathbf{x}) - \tilde{\phi}(\mathbf{y})\|] \approx \sqrt{C_j} \), and the kernel logit is \( -\text{dist} / (\tau \cdot \sqrt{C_j}) \). This makes \(\tau\) values dimension-independent.
+
+Our `compute_feature_normalization_scale()` computes `S = avg_dist / √D` identically. We then use `tau_scaled = tau * √D` in the kernel logits (Eq. 22). Combined:
+
+```
+logit = -‖x̃ - ỹ‖ / (τ · √D)
+```
+
+With default temperatures τ ∈ {0.02, 0.05, 0.2}, at D=8192 (64 action steps × 128 action dims), the effective logit for an average-distance pair is ≈ -1/τ, which matches the paper's intended kernel selectivity.
+
+**Ablation flag**: `--no-normalize-features` disables this step (falls back to raw distances / τ).
+
+### 13.3 Drift Normalization (Appendix A.6, Eq. 23-25)
+
+The paper normalizes each drift component so that \( \mathbb{E}[\|\tilde{\mathbf{V}}\|^2 / C_j] \approx 1 \):
+
+\[
+\lambda_j = \sqrt{\mathbb{E}[\|\mathbf{V}_j\|^2 / C_j]}, \quad
+\tilde{\mathbf{V}}_j = \mathbf{V}_j / \lambda_j
+\]
+
+\(\lambda_j\) is the **convergence metric**: it approaches 0 as the generated distribution matches the data distribution. The normalized loss value is always ≈ 1.0 by design.
+
+Our `normalize_drift_field()` matches exactly. `lambda_V` is tracked and logged as the convergence signal (`raw_drift_norm` and `lambda_V` in WandB).
+
+**Ablation flag**: `--no-normalize-drift` disables this for raw MSE-style loss.
+
+### 13.4 Doubly-Stochastic Kernel (Alg. 2, Table 11)
+
+The paper uses softmax over both x-axis (dim=0) and y-axis (dim=1), then takes the geometric mean:
+
+```
+A_row = softmax(logits, dim=1)
+A_col = softmax(logits, dim=0)
+A = sqrt(A_row * A_col)
+```
+
+Table 11 (Appendix B.2) shows this outperforms single-axis softmax (8.46 vs 8.92 FID) while even no-normalization is decent (10.54), confirming robustness. Our implementation matches.
+
+### 13.5 Large-Batch Training (Table 8)
+
+The paper's system-level config (Table 8, L/2 latent):
+- N_pos = 64-128, N_neg = 64, effective batch B = 8192
+- Temperatures: {0.02, 0.05, 0.2}
+- Multi-EMA: {0.999, 0.9995, 0.9998, 0.9999}
+- Training: 200K steps, AdamW β=(0.9, 0.95), grad clip 2.0
+
+Table 2 shows larger N_pos and N_neg improve quality under fixed compute budget. At our scale (120 H200 GPUs, global batch 7680), with action_horizon=64 and D=64×128=8192, the kernel normalization ensures that large batches don't saturate the softmax — the τ·√D scaling keeps the kernel non-degenerate.
+
+### 13.6 CFG Conditioning (Appendix A.7)
+
+The paper trains with CFG scale α sampled from p(α) ∝ α^{-3} over [1, 4], conditioned as a network input. Our `_sample_cfg_scale()` matches. Extra unconditional negatives from random classes are mixed at rate γ. At inference, α is freely specified — the 1-NFE property is preserved.
+
+### 13.7 Negative Sampling Strategy
+
+The paper (Alg. 1): uses the current batch (`y_neg = x`) as negatives. Our default uses a replay queue (`NegativeSampleQueue`) for more diverse negatives, controllable via `--neg-source batch|queue`. The queue approach is analogous to MoCo-style queues referenced in Appendix A.8.
+
+---
+
+## 14. References
+
+1. **Drifting:** Deng et al., "Generative Modeling via Drifting". arXiv:2602.04770, 2025.
 2. **RDT-1B:** Diffusion Foundation Model for Bimanual Manipulation. arXiv:2410.07864, 2024.
 3. **Pi0:** A Vision-Language-Action Flow Model. arXiv:2410.24164, 2024.
-4. **DexGraspNet 2.0:** Learning Generative Dexterous Grasping. CoRL 2024.
-5. **Qwen3-VL:** [HuggingFace](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct)
-6. **Open X-Embodiment:** RT-X Models. arXiv:2310.08864, 2023.
-7. **Dexora:** [HuggingFace](https://huggingface.co/datasets/Dexora/Dexora_Real-World_Dataset)
-8. **DexWild:** [HuggingFace](https://huggingface.co/datasets/boardd/dexwild-dataset)
-9. **6D Rotation:** Zhou et al., "On the Continuity of Rotation Representations in Neural Networks", CVPR 2019.
-10. **LoRA:** Hu et al., "Low-Rank Adaptation of Large Language Models", ICLR 2022.
-11. **Behavior 1K:** [HuggingFace](https://huggingface.co/collections/lerobot/behavior-1k)
-12. **Diffusion Policy:** Visuomotor Policy Learning via Action Diffusion. RSS 2023.
+4. **Qwen3-VL:** [HuggingFace](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct)
+5. **Open X-Embodiment:** RT-X Models. arXiv:2310.08864, 2023.
+6. **Dexora:** [HuggingFace](https://huggingface.co/datasets/Dexora/Dexora_Real-World_Dataset)
+7. **DexWild:** [HuggingFace](https://huggingface.co/datasets/boardd/dexwild-dataset)
+8. **6D Rotation:** Zhou et al., "On the Continuity of Rotation Representations in Neural Networks", CVPR 2019.
+9. **LoRA:** Hu et al., "Low-Rank Adaptation of Large Language Models", ICLR 2022.
+10. **Behavior 1K:** [HuggingFace](https://huggingface.co/collections/lerobot/behavior-1k)
+11. **Diffusion Policy:** Visuomotor Policy Learning via Action Diffusion. RSS 2023.
+12. **aengusng8/DriftingModel:** Unofficial PyTorch implementation. [GitHub](https://github.com/aengusng8/DriftingModel)

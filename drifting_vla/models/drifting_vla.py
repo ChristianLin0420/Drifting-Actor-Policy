@@ -47,13 +47,13 @@ class DriftingVLAConfig:
     mlp_ratio: float = 4.0
     num_cross_attn_layers: int = 2
 
-    # Action generation
-    action_horizon: int = 16
+    # Action generation (RDT-1B uses 64; matched for temporal coverage)
+    action_horizon: int = 64
     noise_dim: int = 64
     action_dim: int = UNIFIED_ACTION_DIM  # 128
 
-    # Multi-embodiment (0=abs_eef, 1=joints, 2=bimanual, 3=dex_hand, 4=delta_eef, 5=bimanual_mobile)
-    num_embodiments: int = 6
+    # Multi-embodiment (0=abs_eef, 1=joints, 2=bimanual, 3=dex_hand, 4=delta_eef, 5=bimanual_mobile, 6=bimanual_dex)
+    num_embodiments: int = 7
 
     # Proprioception (RDT-1B style)
     use_proprio: bool = True
@@ -451,7 +451,7 @@ class DriftingVLA(nn.Module):
 def create_drifting_vla(
     model_size: str = 'base',
     vlm_model_key: str = 'qwen3vl',
-    action_horizon: int = 16,
+    action_horizon: int = 64,
     **kwargs,
 ) -> DriftingVLA:
     """Factory function for DriftingVLA."""

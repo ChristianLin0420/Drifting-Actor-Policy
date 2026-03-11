@@ -2,7 +2,7 @@
 Unified Multi-Dataset Loader
 ==============================
 
-Wraps heterogeneous datasets (RLBench, DexGraspNet, Bridge, ALOHA, RT-1)
+Wraps heterogeneous datasets (RLBench, Bridge, ALOHA, RT-1)
 into a unified format with 128-dim action space and standardized images.
 
 Supports:

@@ -8,9 +8,17 @@
     "cmu_stretch": 10,
     "nyu_franka": 3,
     "stanford_hydra": 10,
-    "dexgraspnet": 1,
     "dexwild": 30,
     "dexora": 20,
-    "behavior1k_t0000": 30
+    "behavior1k_t0000": 30,
+    "bridgev2": 5,
+    "kuka": 10,
+    "berkeley_fanuc": 10,
+    "cmu_play_fusion": 5,
+    "jaco_play": 10,
+    "austin_buds": 20,
+    "austin_sailor": 20,
+    "austin_sirius": 20,
+    "columbia_pusht": 10,
+    "nyu_door": 3
 }
-

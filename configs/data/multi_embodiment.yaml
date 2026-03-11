@@ -4,7 +4,7 @@
 # Datasets for Drifting-VLA pretraining across gripper, bimanual, and dex hand.
 #
 # Usage:
-#   python scripts/train.py --datasets rlbench aloha droid bc_z dexgraspnet
+#   python scripts/train.py --datasets rlbench aloha droid bc_z
 
 data_root: './data'
 vlm_features_dir: './data/vlm_features'
@@ -14,19 +14,18 @@ cameras:
   - front
   - wrist
 
-action_horizon: 16
+action_horizon: 64
 unified_action_dim: 128
 
 # ─────────────────────────────────────────────────────
 # Dataset                    Samples    Action  Embody    Disk (full)    VLM feat
 # ─────────────────────────────────────────────────────
 # rlbench (18 tasks)        ~270,000   8-dim   gripper   ~50 GB         ~1.1 GB
-# dexgraspnet 2.0           ~500,000   23-dim  dex hand  ~100 GB        ~2.0 GB
 # aloha (sim cube)            20,000   14-dim  bimanual  ~8 GB          ~80 MB
 # droid (100 episodes)        32,212   7-dim   gripper   ~15 GB         ~130 MB
 # bc_z (autolab ur5)          97,939   7-dim   gripper   ~30 GB         ~400 MB
 # ─────────────────────────────────────────────────────
-# TOTAL                     ~920,000                      ~203 GB        ~3.7 GB
+# TOTAL                     ~420,000                      ~103 GB        ~1.7 GB
 
 datasets:
   # Gripper
@@ -47,11 +46,6 @@ datasets:
     weight: 0.15
     embodiment: bimanual
     hf_repo: lerobot/aloha_sim_transfer_cube_human_image
-  # Dexterous hand
-  - name: dexgraspnet
-    weight: 0.40
-    embodiment: dex_hand
-    hf_repo: lhrlhr/DexGraspNet2.0
 
 sample_queue:
   pos_queue_size: 256
@@ -63,7 +57,7 @@ sample_queue:
 # Datasets for Drifting-VLA pretraining across gripper, bimanual, and dex hand.
 #
 # Usage:
-#   python scripts/train.py --datasets rlbench aloha droid bc_z dexgraspnet
+#   python scripts/train.py --datasets rlbench aloha droid bc_z
 
 data_root: './data'
 vlm_features_dir: './data/vlm_features'
@@ -73,19 +67,18 @@ cameras:
   - front
   - wrist
 
-action_horizon: 16
+action_horizon: 64
 unified_action_dim: 128
 
 # ─────────────────────────────────────────────────────
 # Dataset                    Samples    Action  Embody    Disk (full)    VLM feat
 # ─────────────────────────────────────────────────────
 # rlbench (18 tasks)        ~270,000   8-dim   gripper   ~50 GB         ~1.1 GB
-# dexgraspnet 2.0           ~500,000   23-dim  dex hand  ~100 GB        ~2.0 GB
 # aloha (sim cube)            20,000   14-dim  bimanual  ~8 GB          ~80 MB
 # droid (100 episodes)        32,212   7-dim   gripper   ~15 GB         ~130 MB
 # bc_z (autolab ur5)          97,939   7-dim   gripper   ~30 GB         ~400 MB
 # ─────────────────────────────────────────────────────
-# TOTAL                     ~920,000                      ~203 GB        ~3.7 GB
+# TOTAL                     ~420,000                      ~103 GB        ~1.7 GB
 
 datasets:
   # Gripper
@@ -106,11 +99,6 @@ datasets:
     weight: 0.15
     embodiment: bimanual
     hf_repo: lerobot/aloha_sim_transfer_cube_human_image
-  # Dexterous hand
-  - name: dexgraspnet
-    weight: 0.40
-    embodiment: dex_hand
-    hf_repo: lhrlhr/DexGraspNet2.0
 
 sample_queue:
   pos_queue_size: 256

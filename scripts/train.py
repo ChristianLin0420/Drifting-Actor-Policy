@@ -68,7 +68,7 @@ class TrainConfig:
     hidden_dim: int = 768
     num_layers: int = 12
     num_heads: int = 12
-    action_horizon: int = 16
+    action_horizon: int = 64
     noise_dim: int = 64
     use_flash_attn: bool = False  # Set to False for A40 debugging
     
@@ -98,6 +98,9 @@ class TrainConfig:
     n_neg_samples: int = 64
     neg_queue_size: int = 8192      # Single large global queue
     pos_queue_size: int = 4096      # Single large global queue
+    normalize_features: bool = True   # Paper Appendix A.6 Eq. 18-21
+    normalize_drift: bool = True      # Paper Appendix A.6 Eq. 23-25
+    neg_source: str = 'queue'         # 'queue' (replay buffer) or 'batch'
     
     # EMA
     ema_decay: float = 0.9999
@@ -369,8 +372,8 @@ class DriftingVLATrainer:
         
         self.loss_fn = DriftingLoss(
             temperatures=cfg.temperatures,
-            normalize_features=True,
-            normalize_drift=True,
+            normalize_features=cfg.normalize_features,
+            normalize_drift=cfg.normalize_drift,
         )
     
     def _build_queues(self):
@@ -588,6 +591,17 @@ class DriftingVLATrainer:
             self.scheduler.step()
             self.ema.update()
             metrics['grad_norm'] = grad_norm.item()
+
+            # Track per-group gradient norms for E2 visualization
+            if self.is_main:
+                for pg in self.optimizer.param_groups:
+                    gname = pg.get('name', 'unknown')
+                    gnorm = sum(p.grad.norm().item() ** 2 for p in pg['params']
+                                if p.grad is not None) ** 0.5
+                    if gname not in self.viz_logger._grad_history:
+                        self.viz_logger._grad_history[gname] = []
+                    self.viz_logger._grad_history[gname].append(
+                        (self.global_step + 1, gnorm))
         
         metrics['loss'] = loss.item()
         metrics['lr'] = self.optimizer.param_groups[0]['lr']
@@ -725,7 +739,26 @@ class DriftingVLATrainer:
                     per_temp_losses=self._last_per_temp,
                     wandb_run=self.wandb_run,
                 )
-            
+
+                # E-series pretraining diagnostics
+                if (step + 1) % 500 == 0:
+                    try:
+                        from drifting_vla.training.visualizations import (
+                            create_gradient_flow, create_queue_health,
+                        )
+                        e2_img = create_gradient_flow(self.viz_logger._grad_history, step + 1)
+                        if e2_img is not None:
+                            wandb.log({'viz/E2_gradient_flow': e2_img}, step=step+1)
+
+                        e3_img = create_queue_health(
+                            self.pos_queue.total_samples(), self.neg_queue.count,
+                            cfg.pos_queue_size, cfg.neg_queue_size, step + 1,
+                        )
+                        if e3_img is not None:
+                            wandb.log({'viz/E3_queue_health': e3_img}, step=step+1)
+                    except Exception as e:
+                        logger.debug(f"E-series viz error: {e}")
+
             # Evaluation
             if self.is_main and (step + 1) % cfg.eval_every == 0:
                 eval_metrics = self._run_evaluation(step + 1)
@@ -942,7 +975,24 @@ class DriftingVLATrainer:
             if any(c != 0 for c in agg['coverage']):
                 eval_metrics[f'eval_emb/{emb_name}/coverage_pct'] = float(np.mean([c for c in agg['coverage'] if c != 0]))
             eval_metrics[f'eval_emb/{emb_name}/n_datasets'] = len(agg['datasets'])
-        
+
+            # Track for E1 per-embodiment convergence viz
+            if emb_name not in self.viz_logger._per_emb_mse_history:
+                self.viz_logger._per_emb_mse_history[emb_name] = []
+            self.viz_logger._per_emb_mse_history[emb_name].append(
+                (step, float(np.mean(agg['mse']))))
+
+        # E1: Per-embodiment convergence plot
+        if self.wandb_run and self.viz_logger._per_emb_mse_history:
+            try:
+                from drifting_vla.training.visualizations import create_embodiment_convergence
+                e1_img = create_embodiment_convergence(
+                    self.viz_logger._per_emb_mse_history, step)
+                if e1_img is not None:
+                    eval_metrics['viz/E1_embodiment_convergence'] = e1_img
+            except Exception as e:
+                logger.debug(f"E1 viz error: {e}")
+
         # Overall aggregate
         if all_mse:
             eval_metrics['eval/overall_mse'] = float(np.mean(all_mse))
@@ -1097,7 +1147,18 @@ def parse_args():
                         help='Enable image augmentation (ColorJitter)')
     parser.add_argument('--cond-mask-prob', type=float, default=0.1,
                         help='Condition masking probability for CFG training')
-    
+
+    # Drifting field controls (Appendix A.6 of the paper)
+    parser.add_argument('--normalize-features', action='store_true', default=True,
+                        help='Feature normalization so E[‖x-y‖]≈√D (paper Eq.18-21)')
+    parser.add_argument('--no-normalize-features', dest='normalize_features', action='store_false')
+    parser.add_argument('--normalize-drift', action='store_true', default=True,
+                        help='Drift normalization Ṽ=V/λ (paper Eq.23-25)')
+    parser.add_argument('--no-normalize-drift', dest='normalize_drift', action='store_false')
+    parser.add_argument('--neg-source', type=str, default='queue',
+                        choices=['queue', 'batch'],
+                        help='Negative samples: replay queue (default) or same batch')
+
     return parser.parse_args()
 
 
@@ -1143,7 +1204,10 @@ def main():
     config.eval_batches = args.eval_batches
     config.image_aug = args.image_aug
     config.cond_mask_prob = args.cond_mask_prob
-    
+    config.normalize_features = args.normalize_features
+    config.normalize_drift = args.normalize_drift
+    config.neg_source = args.neg_source
+
     # Model size configs
     size_cfgs = {
         'small': (512, 8, 8),

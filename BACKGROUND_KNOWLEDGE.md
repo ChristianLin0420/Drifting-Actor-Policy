@@ -477,10 +477,9 @@ Default is now **online VLM** (Pi0-style). VLM runs live in each forward pass. L
 **Goal:** Build a unified foundation model that controls gripper, bimanual, and dexterous hand robots through one-step action generation, achieving:
 
 1. **>80% success** on RLBench (18 tasks, gripper)
-2. **>70% success** on DexGraspNet 2.0 (dexterous grasping)
-3. **>50% success** on ManiSkill (bimanual)
-4. **<50ms inference** (20 Hz real-time control)
-5. **10× faster** than diffusion baselines (RDT-1B, Diffusion Policy)
+2. **>50% success** on ManiSkill (bimanual)
+3. **<50ms inference** (20 Hz real-time control)
+4. **10× faster** than diffusion baselines (RDT-1B, Diffusion Policy)
 
 **Target venue:** NeurIPS 2026
 
@@ -491,11 +490,10 @@ Default is now **online VLM** (Pi0-style). VLM runs live in each forward pass. L
 1. **Drifting:** [arXiv:2602.04770](https://arxiv.org/abs/2602.04770) — One-Step Generation via Training-Time Distribution Evolution.
 2. **Demo notebook:** [Colab](https://colab.research.google.com/github/lambertae/lambertae.github.io/blob/main/projects/drifting/notebooks/drifting_model_demo.ipynb)
 3. **RDT-1B:** [arXiv:2410.07864](https://arxiv.org/abs/2410.07864) — Diffusion Foundation Model for Bimanual Manipulation.
-4. **DexGraspNet 2.0:** [GitHub](https://github.com/PKU-EPIC/DexGraspNet2) — Generative Dexterous Grasping.
-5. **Qwen3-VL:** [HuggingFace](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) — Multimodal Vision-Language Model.
-6. **Open X-Embodiment:** [arXiv:2310.08864](https://arxiv.org/abs/2310.08864) — Robotic Learning Datasets.
-7. **LeRobot OXE:** [HuggingFace Collection](https://huggingface.co/collections/lerobot/open-x-embodiment)
-8. **Behavior 1K:** [HuggingFace Collection](https://huggingface.co/collections/lerobot/behavior-1k)
-9. **Diffusion Policy:** RSS 2023 — Visuomotor Policy Learning via Action Diffusion.
-10. **Pi0:** Physical Intelligence — Flow-matching VLA with online VLM co-training.
+4. **Qwen3-VL:** [HuggingFace](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) — Multimodal Vision-Language Model.
+5. **Open X-Embodiment:** [arXiv:2310.08864](https://arxiv.org/abs/2310.08864) — Robotic Learning Datasets.
+6. **LeRobot OXE:** [HuggingFace Collection](https://huggingface.co/collections/lerobot/open-x-embodiment)
+7. **Behavior 1K:** [HuggingFace Collection](https://huggingface.co/collections/lerobot/behavior-1k)
+8. **Diffusion Policy:** RSS 2023 — Visuomotor Policy Learning via Action Diffusion.
+9. **Pi0:** Physical Intelligence — Flow-matching VLA with online VLM co-training.
 

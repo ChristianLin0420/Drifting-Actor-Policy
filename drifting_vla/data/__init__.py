@@ -9,13 +9,12 @@ Episode-centric HDF5 data pipeline with unified 128-dim action space:
     - sample_queue: Positive/negative sample queues for drifting loss
 
 Legacy (still used by converter and old pipeline):
-    - RLBenchDataset, DexGraspNetDataset, LeRobotDataset, BaseVLADataset
+    - RLBenchDataset, LeRobotDataset, BaseVLADataset
 """
 
 from drifting_vla.data.episode_dataset import EpisodeHDF5Dataset
 from drifting_vla.data.base_dataset import BaseVLADataset
 from drifting_vla.data.rlbench_dataset import RLBenchDataset
-from drifting_vla.data.dexgraspnet_dataset import DexGraspNetDataset
 from drifting_vla.data.lerobot_dataset import LeRobotDataset
 from drifting_vla.data.unified_dataset import UnifiedDataset, collate_unified
 from drifting_vla.data.sample_queue import SampleQueue, GlobalSampleQueue, NegativeSampleQueue
@@ -29,7 +28,6 @@ __all__ = [
     "EpisodeHDF5Dataset",
     "BaseVLADataset",
     "RLBenchDataset",
-    "DexGraspNetDataset",
     "LeRobotDataset",
     "UnifiedDataset",
     "collate_unified",

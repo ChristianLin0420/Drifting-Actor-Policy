@@ -2,26 +2,27 @@
 Drifting Field Computation (Algorithm 2)
 ========================================
 
-This module implements the core drifting field computation from the Drifting
-model paper. The drifting field V_{p,q}(x) provides the direction to evolve
-generated samples toward the data distribution.
+Implements the drifting field V_{p,q}(x) from:
+  "Generative Modeling via Drifting" (Deng et al., 2025)
+  https://arxiv.org/abs/2602.04770
 
-Mathematical Formulation:
-    V_{p,q}(x) = V_p^+(x) - V_q^-(x)
-    
-    where:
-    - V_p^+(x) = E_{y+ ~ p}[k_tilde(x, y+)(y+ - x)]  (attraction to data)
-    - V_q^-(x) = E_{y- ~ q}[k_tilde(x, y-)(y- - x)]  (repulsion from generated)
-    - k_tilde(x, y) = k(x, y) / Z(x)  (normalized kernel)
-    - k(x, y) = exp(-||x - y|| / tau)  (base kernel)
+Aligned with the paper's Algorithm 2 (Appendix A.1) and normalization
+scheme (Appendix A.6, Eq. 18-25):
 
-Key Features:
-    - Multi-temperature kernels (tau = 0.02, 0.05, 0.2)
-    - Double softmax normalization (row and column)
-    - Feature normalization for scale invariance
-    - Drift normalization for stable training
+  V(x) = E_{p,q}[ k̃(x,y+) k̃(x,y-) (y+ - y-) ]        — Eq. (11)
+
+where k̃ is the doubly-stochastic normalized kernel (Alg. 2) and the
+implementation uses cross-weighting W_pos = A_pos * Σ(A_neg) per Alg. 2.
+
+Feature normalization: scale features so E[‖x-y‖] ≈ √D, then use
+τ̃ = τ·√D for the kernel logits (Eq. 22).  This makes τ values
+(default {0.02, 0.05, 0.2}) dimension-independent.
+
+Drift normalization: λ = √(E[‖V‖²/D]), Ṽ = V/λ  (Eq. 23-25).
+λ→0 at equilibrium, serving as the convergence metric.
 """
 
+import math
 import torch
 import torch.nn.functional as F
 from typing import Optional
@@ -39,154 +40,112 @@ def compute_drifting_field(
 ):
     """
     Compute the drifting field V_{p,q}(x) for generated samples.
-    
-    The drifting field provides the direction to evolve generated samples
-    toward the data distribution through attraction to positive samples
-    and repulsion from negative (generated) samples.
-    
+
+    Follows Algorithm 2 and Appendix A.6 of the paper exactly:
+      1. Feature normalization so E[‖x̃-ỹ‖] ≈ √D  (Eq. 18-21)
+      2. Kernel logits: -dist / (τ·√D)              (Eq. 22)
+      3. Doubly-stochastic normalization (Alg. 2)
+      4. Cross-weighting: W_pos *= Σ(A_neg)          (Alg. 2)
+      5. V = W_pos @ ỹ_pos - W_neg @ ỹ_neg          (Eq. 11)
+      6. Drift normalization: Ṽ = V/λ               (Eq. 23-25)
+
     Args:
         x: Generated samples [N, D].
         y_pos: Positive samples (expert actions) [N_pos, D].
         y_neg: Negative samples (generated) [N_neg, D].
         temperatures: Temperature values for multi-scale kernels.
-        normalize_features: Normalize features for scale invariance.
-        normalize_drift: Normalize drift field (E[||V||^2/D] ≈ 1).
+        normalize_features: Normalize features so E[‖x-y‖] ≈ √D.
+        normalize_drift: Normalize drift field (E[‖V‖²/D] ≈ 1).
         eps: Numerical stability constant.
         return_raw_norm: If True, also return (V_raw_norm, lambda_V).
-    
+
     Returns:
         V: Drifting field [N, D] (normalized if normalize_drift=True).
-        If return_raw_norm=True, returns (V, V_raw_norm, lambda_V):
-            V_raw_norm: E[||V_raw||^2] before normalization (convergence metric)
-            lambda_V: Normalization factor sqrt(E[||V||^2]/D) → 0 at convergence
+        If return_raw_norm=True, returns (V, V_raw_norm, lambda_V).
     """
     N, D = x.shape
-    
-    # Feature normalization (scale invariance)
+
     if normalize_features:
         scale = compute_feature_normalization_scale(x, y_pos, y_neg, D, eps)
-        x_normalized = x / (scale + eps)
-        y_pos_normalized = y_pos / (scale + eps)
-        y_neg_normalized = y_neg / (scale + eps)
+        x_n = x / (scale + eps)
+        y_pos_n = y_pos / (scale + eps)
+        y_neg_n = y_neg / (scale + eps)
     else:
-        x_normalized = x
-        y_pos_normalized = y_pos
-        y_neg_normalized = y_neg
-    
-    # Accumulate drifting field across temperatures
+        x_n = x
+        y_pos_n = y_pos
+        y_neg_n = y_neg
+
     V_total = torch.zeros_like(x)
-    
+
     for tau in temperatures:
         V_tau = _compute_drifting_field_single_temp(
-            x_normalized, y_pos_normalized, y_neg_normalized,
-            x, y_pos, y_neg,
-            tau, eps
+            x_n, y_pos_n, y_neg_n, tau, D, eps,
         )
         V_total = V_total + V_tau
-    
-    # Compute raw drift magnitude BEFORE normalization (true convergence metric)
+
     V_raw_norm = (V_total ** 2).sum(dim=1).mean().detach()
     lambda_V = torch.sqrt(V_raw_norm / D + eps).detach()
-    
-    # Drift normalization (stable training)
+
     if normalize_drift:
         V_total = normalize_drift_field(V_total, D, eps)
-    
+
     if return_raw_norm:
         return V_total, V_raw_norm, lambda_V
     return V_total
 
 
 def _compute_drifting_field_single_temp(
-    x_norm: torch.Tensor,
-    y_pos_norm: torch.Tensor, 
-    y_neg_norm: torch.Tensor,
-    x_orig: torch.Tensor,
-    y_pos_orig: torch.Tensor,
-    y_neg_orig: torch.Tensor,
+    x: torch.Tensor,
+    y_pos: torch.Tensor,
+    y_neg: torch.Tensor,
     tau: float,
+    D: int,
     eps: float,
 ) -> torch.Tensor:
     """
-    Compute drifting field for a single temperature value.
-    
-    This implements the double softmax normalization from the paper:
-    1. Row-wise softmax: normalize over y-axis (samples)
-    2. Column-wise softmax: normalize over x-axis (queries)
-    3. Geometric mean of both normalizations
-    
-    Args:
-        x_norm: Normalized generated samples [N, D]
-        y_pos_norm: Normalized positive samples [N_pos, D]
-        y_neg_norm: Normalized negative samples [N_neg, D]
-        x_orig: Original generated samples (for drift direction) [N, D]
-        y_pos_orig: Original positive samples [N_pos, D]
-        y_neg_orig: Original negative samples [N_neg, D]
-        tau: Temperature value for the kernel
-        eps: Numerical stability constant
-    
-    Returns:
-        V: Drifting field at this temperature [N, D]
+    Drifting field for one temperature — Algorithm 2 of the paper.
+
+    All inputs are in the same (optionally normalized) feature space.
+    Kernel logits use τ̃ = τ·√D so that τ values are dimension-independent
+    (Appendix A.6, Eq. 22).
+
+    Drift is computed as V = W_pos @ y_pos - W_neg @ y_neg (Eq. 11),
+    with NO center-subtraction (unlike mean-shift Eq. 8/10 decomposition).
     """
-    N = x_norm.shape[0]
-    N_pos = y_pos_norm.shape[0]
-    N_neg = y_neg_norm.shape[0]
-    
-    # Compute pairwise L2 distances
-    dist_pos = torch.cdist(x_norm, y_pos_norm, p=2)  # [N, N_pos]
-    dist_neg = torch.cdist(x_norm, y_neg_norm, p=2)  # [N, N_neg]
-    
-    # Handle self-comparison in negatives (if y_neg is x)
-    # Check if shapes match and content is similar
+    N = x.shape[0]
+    N_pos = y_pos.shape[0]
+    N_neg = y_neg.shape[0]
+
+    dist_pos = torch.cdist(x, y_pos, p=2)  # [N, N_pos]
+    dist_neg = torch.cdist(x, y_neg, p=2)  # [N, N_neg]
+
     if N == N_neg:
-        # Create mask for self-comparisons
-        self_mask = torch.eye(N, device=x_norm.device, dtype=torch.bool)
+        self_mask = torch.eye(N, device=x.device, dtype=torch.bool)
         dist_neg = dist_neg.masked_fill(self_mask, float('inf'))
-    
-    # Compute kernel logits (negative distance / temperature)
-    logit_pos = -dist_pos / tau  # [N, N_pos]
-    logit_neg = -dist_neg / tau  # [N, N_neg]
-    
-    # Concatenate for joint normalization
+
+    # τ̃ = τ · √D  (Eq. 22 — makes τ dimension-independent)
+    tau_scaled = tau * math.sqrt(D)
+
+    logit_pos = -dist_pos / tau_scaled  # [N, N_pos]
+    logit_neg = -dist_neg / tau_scaled  # [N, N_neg]
+
     logits = torch.cat([logit_pos, logit_neg], dim=1)  # [N, N_pos + N_neg]
-    
-    # Double softmax normalization
-    # Row-wise: normalize over all samples (positive + negative)
-    A_row = F.softmax(logits, dim=1)  # [N, N_pos + N_neg]
-    
-    # Column-wise: normalize over all queries
-    A_col = F.softmax(logits, dim=0)  # [N, N_pos + N_neg]
-    
-    # Geometric mean of normalizations
-    A = torch.sqrt(A_row * A_col + eps)  # [N, N_pos + N_neg]
-    
-    # Split attention weights
+
+    # Doubly-stochastic normalization (Alg. 2)
+    A_row = F.softmax(logits, dim=1)
+    A_col = F.softmax(logits, dim=0)
+    A = torch.sqrt(A_row * A_col + eps)
+
     A_pos = A[:, :N_pos]  # [N, N_pos]
     A_neg = A[:, N_pos:]  # [N, N_neg]
-    
-    # Compute cross-attention weights
-    # W_pos weights positive samples by negative attention
-    # W_neg weights negative samples by positive attention
-    neg_sum = A_neg.sum(dim=1, keepdim=True)  # [N, 1]
-    pos_sum = A_pos.sum(dim=1, keepdim=True)  # [N, 1]
-    
-    W_pos = A_pos * neg_sum  # [N, N_pos]
-    W_neg = A_neg * pos_sum  # [N, N_neg]
-    
-    # Compute drift directions (use original scale)
-    # Attraction toward positive samples
-    drift_pos = W_pos @ y_pos_orig  # [N, D]
-    center_pos = W_pos.sum(dim=1, keepdim=True) * x_orig  # Weighted center
-    V_pos = drift_pos - center_pos  # [N, D]
-    
-    # Repulsion from negative samples  
-    drift_neg = W_neg @ y_neg_orig  # [N, D]
-    center_neg = W_neg.sum(dim=1, keepdim=True) * x_orig
-    V_neg = drift_neg - center_neg  # [N, D]
-    
-    # Final drifting field: attraction - repulsion
-    V = V_pos - V_neg  # [N, D]
-    
+
+    # Cross-weighting (Alg. 2): W_pos *= Σ(A_neg), W_neg *= Σ(A_pos)
+    W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)  # [N, N_pos]
+    W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)  # [N, N_neg]
+
+    # V = W_pos @ y_pos - W_neg @ y_neg  (Eq. 11, no center-subtraction)
+    V = W_pos @ y_pos - W_neg @ y_neg  # [N, D]
+
     return V
 
 

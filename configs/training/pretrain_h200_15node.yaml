@@ -1,0 +1,98 @@
+# =============================================================================
+# 15-Node H200 Pretraining Configuration
+# =============================================================================
+# 15 nodes × 8 H200 GPUs = 120 GPUs
+# Global batch: 64/gpu × 1 accum × 120 GPUs = 7,680
+#
+# Aligned with RDT-1B pretrain.sh settings:
+#   batch=64, lr=1e-4, constant schedule, AdamW(0.9, 0.999), grad_clip=1.0
+# Drifting loss aligned with paper Table 8:
+#   N_pos=128, N_neg=64, τ={0.02,0.05,0.2}
+#
+# Launch:
+#   torchrun --nnodes=15 --nproc_per_node=8 \
+#     --rdzv_id=drifting_pretrain --rdzv_backend=c10d \
+#     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+#     scripts/train.py \
+#     --config configs/training/pretrain_h200_15node.yaml
+
+# Model
+model_size: 'base'
+vlm: 'qwen3vl'
+vlm_mode: 'lora'
+lora_r: 16
+vlm_lr_scale: 0.1
+
+# Data — 22 datasets across 7 embodiment types
+datasets:
+  # Original datasets
+  - aloha
+  - bc_z
+  - taco_play
+  - stanford_hydra
+  - cmu_stretch
+  - utaustin_mutex
+  - nyu_franka
+  - rlbench
+  - dexwild
+  - dexora
+  - behavior1k_t0000
+  - behavior1k_t0001
+  - behavior1k_t0002
+  - behavior1k_t0003
+  - behavior1k_t0004
+  # Open X-Embodiment additions (verified repos)
+  - bridgev2
+  - kuka
+  - berkeley_fanuc
+  - cmu_play_fusion
+  - jaco_play
+  - austin_buds
+  - austin_sailor
+  - austin_sirius
+  - columbia_pusht
+  - nyu_door
+
+image_size: 448
+action_horizon: 64
+
+# Optimization — aligned with RDT-1B
+batch_size: 64
+grad_accumulation_steps: 1
+learning_rate: 1e-4
+weight_decay: 0.01
+warmup_steps: 10000
+max_steps: 500000
+grad_clip: 1.0
+
+# Drifting Loss (paper Table 8)
+loss_type: 'hybrid'
+drift_weight: 0.001
+temperatures: [0.02, 0.05, 0.2]
+n_pos_samples: 128
+n_neg_samples: 64
+neg_queue_size: 16384
+pos_queue_size: 8192
+normalize_features: true
+normalize_drift: true
+
+# EMA
+ema_decay: 0.9999
+
+# AMP
+use_amp: true
+amp_dtype: 'bfloat16'
+
+# DataLoader
+num_workers: 16
+image_aug: true
+cond_mask_prob: 0.1
+
+# Logging
+log_every: 100
+eval_every: 2000
+save_every: 5000
+
+# WandB
+wandb_mode: 'online'
+wandb_project: 'drifting-vla-pretrain'

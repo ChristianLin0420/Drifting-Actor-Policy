@@ -13,7 +13,6 @@ Replaces the old two-step pipeline:
 Supported dataset types:
   - lerobot  : HF datasets API  → stream rows → episode HDF5
   - rlbench  : snapshot_download → read PKL/PNG → episode HDF5
-  - dexgrasp : snapshot_download → read NPZ/PNG → scene HDF5
   - dexwild  : snapshot_download → read source HDF5 → episode HDF5
 
 Usage:
@@ -78,11 +77,6 @@ DATASETS = {
         'description': 'RLBench 18-task sim (270K, 8-dim gripper)',
 
     },
-    'dexgraspnet': {
-        'hf_repo': 'lhrlhr/DexGraspNet2.0',
-        'type': 'dexgraspnet',
-        'description': 'DexGraspNet 2.0 dexterous grasping (500K, 23-dim dex hand)',
-    },
     'aloha': {
         'hf_repo': 'lerobot/aloha_sim_transfer_cube_human_image',
         'type': 'lerobot',
@@ -124,14 +118,65 @@ DATASETS = {
         'description': 'Stanford HYDRA diverse manip (358K, 7-dim gripper)',
     },
     'dexwild': {
-        'hf_repo': 'YingyangPolarBear/DexWild',
+        'hf_repo': 'boardd/dexwild-dataset',
         'type': 'dexwild',
         'description': 'DexWild dexterous LEAP hand (95K, 22-dim dex)',
     },
     'dexora': {
         'hf_repo': 'Dexora/Dexora_Real-World_Dataset',
-        'type': 'lerobot',
+        'type': 'dexora',
         'description': 'Dexora bimanual dexterous real-world (2.9M, 39-dim)',
+    },
+    # ── Open X-Embodiment additions (LeRobot format) ──
+    'bridgev2': {
+        'hf_repo': 'jxie/bridge_data_v2',
+        'type': 'hf_generic',
+        'description': 'BridgeV2 diverse manip (53K, 8-dim delta EEF)',
+    },
+    'kuka': {
+        'hf_repo': 'lerobot/stanford_kuka_multimodal_dataset',
+        'type': 'lerobot',
+        'description': 'Stanford Kuka mobile manip (579K, 11-dim EEF+base)',
+    },
+    'berkeley_fanuc': {
+        'hf_repo': 'lerobot/berkeley_fanuc_manipulation',
+        'type': 'lerobot',
+        'description': 'Berkeley FANUC manip (63K, 7-dim delta EEF)',
+    },
+    'cmu_play_fusion': {
+        'hf_repo': 'lerobot/cmu_play_fusion',
+        'type': 'lerobot',
+        'description': 'CMU PlayFusion manip (236K, 8-dim EEF)',
+    },
+    'jaco_play': {
+        'hf_repo': 'lerobot/jaco_play',
+        'type': 'lerobot',
+        'description': 'Jaco Play 3-DOF (78K, 3-dim delta pos)',
+    },
+    'austin_buds': {
+        'hf_repo': 'lerobot/austin_buds_dataset',
+        'type': 'lerobot',
+        'description': 'UT Austin BUDS diverse manip (34K, 8-dim delta EEF)',
+    },
+    'austin_sailor': {
+        'hf_repo': 'lerobot/austin_sailor_dataset',
+        'type': 'lerobot',
+        'description': 'UT Austin SAILOR manip (353K, 10-dim abs EEF+6D rot)',
+    },
+    'austin_sirius': {
+        'hf_repo': 'lerobot/austin_sirius_dataset',
+        'type': 'lerobot',
+        'description': 'UT Austin SIRIUS manip (280K, 10-dim abs EEF+6D rot)',
+    },
+    'columbia_pusht': {
+        'hf_repo': 'lerobot/columbia_cairlab_pusht_real',
+        'type': 'lerobot',
+        'description': 'Columbia PushT real (28K, 7-dim delta EEF)',
+    },
+    'nyu_door': {
+        'hf_repo': 'lerobot/nyu_door_opening_surprising_effectiveness',
+        'type': 'lerobot',
+        'description': 'NYU door opening (20K, 7-dim EEF vel+gripper)',
     },
 }
 
@@ -149,12 +194,22 @@ DATASET_VIEW_NAMES = {
     'aloha': ['top'],
     'bc_z': ['image', 'hand_image'],
     'taco_play': ['image'],
-    'utaustin_mutex': [],
+    'utaustin_mutex': ['image', 'wrist_image'],
     'cmu_stretch': ['image'],
     'nyu_franka': ['image'],
     'stanford_hydra': ['image'],
-    'dexgraspnet': [f'view_{i}' for i in range(8)],
     'dexwild': ['thumb_cam', 'pinky_cam'],
+    # Open X-Embodiment additions (auto-detected by _detect_image_keys if empty)
+    'bridgev2': ['image'],
+    'kuka': ['image'],
+    'berkeley_fanuc': ['image', 'wrist_image'],
+    'cmu_play_fusion': ['image'],
+    'jaco_play': ['image'],
+    'austin_buds': ['image'],
+    'austin_sailor': ['image'],
+    'austin_sirius': ['image'],
+    'columbia_pusht': ['image'],
+    'nyu_door': ['image'],
 }
 for _i in range(50):
     DATASET_VIEW_NAMES[f'behavior1k_t{_i:04d}'] = ['head', 'left_wrist', 'right_wrist']
@@ -843,137 +898,6 @@ def prepare_rlbench(
 
 
 # =============================================================================
-# DexGraspNet — snapshot_download → read NPZ/PNG → scene HDF5
-# =============================================================================
-
-def prepare_dexgraspnet(
-    ds_info: dict,
-    output_dir: Path,
-    data_root: Path,
-    image_size: int = 448,
-    max_episodes: int = None,
-    **kwargs,
-):
-    """Download + convert DexGraspNet in one pass."""
-    from huggingface_hub import snapshot_download
-    from scipy.spatial.transform import Rotation
-
-    dex_dir = data_root / 'dexgraspnet'
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── Download ──
-    scenes_dir = dex_dir / 'scenes'
-    if not scenes_dir.exists():
-        logger.info("  Downloading DexGraspNet ...")
-        try:
-            snapshot_download(
-                repo_id=ds_info['hf_repo'], repo_type='dataset',
-                local_dir=str(dex_dir),
-                allow_patterns=['*.parquet', '*.json', '*.h5', '*.hdf5', '*.npz', 'README*'],
-                ignore_patterns=['*.ply', '*.obj', '*.stl', '*.png', '*.jpg'],
-            )
-        except Exception as e:
-            logger.error(f"  Download failed: {e}")
-            return False
-
-    if not scenes_dir.exists():
-        logger.error(f"  No scenes/ directory found at {scenes_dir}")
-        return False
-
-    # ── Convert ──
-    scene_dirs = sorted([d for d in scenes_dir.iterdir() if d.is_dir() and d.name.startswith('scene_')])
-    if max_episodes:
-        scene_dirs = scene_dirs[:max_episodes]
-
-    rendered_dir = dex_dir / 'rendered'
-    embodiment_id = DATASET_EMBODIMENT.get('dexgraspnet', 3)
-    native_dim = DATASET_NATIVE_ACTION_DIM.get('dexgraspnet', 23)
-    mask_info = get_action_mask(embodiment_id, native_dim=native_dim)
-
-    all_actions = []
-    ep_metadata_list = []
-
-    for scene_dir in tqdm(scene_dirs, desc="  dexgraspnet"):
-        scene_name = scene_dir.name
-        npz_files = sorted((scene_dir / 'realsense').glob('*.npz')) if (scene_dir / 'realsense').exists() else []
-        if not npz_files:
-            continue
-
-        images_list = []
-        render_scene_dir = rendered_dir / scene_name if rendered_dir.exists() else None
-        if render_scene_dir and render_scene_dir.exists():
-            for vf in sorted(render_scene_dir.glob('view_*.png'))[:8]:
-                try:
-                    img = cv2.imread(str(vf))
-                    if img is not None:
-                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        img = cv2.resize(img, (image_size, image_size))
-                        images_list.append(img)
-                except Exception:
-                    pass
-
-        if not images_list:
-            continue
-
-        n_views = len(images_list)
-        images_arr = np.stack(images_list, axis=0).astype(np.uint8)
-
-        all_grasps = []
-        object_names = set()
-        for npz_file in npz_files:
-            try:
-                data = np.load(str(npz_file), allow_pickle=True)
-                translations = data.get('translation')
-                rotations_data = data.get('rotation')
-                if translations is None or rotations_data is None:
-                    continue
-                K = translations.shape[0]
-                for k in range(K):
-                    xyz = translations[k].astype(np.float32)
-                    try:
-                        quat = Rotation.from_matrix(rotations_data[k].astype(np.float32)).as_quat().astype(np.float32)
-                    except Exception:
-                        quat = np.array([0, 0, 0, 1], dtype=np.float32)
-                    fingers = np.zeros(16, dtype=np.float32)
-                    for j in range(16):
-                        jkey = f'j{j}'
-                        if jkey in data and k < len(data[jkey]):
-                            fingers[j] = float(data[jkey][k])
-                    all_grasps.append(np.concatenate([xyz, quat, fingers]))
-            except Exception:
-                continue
-
-        if not all_grasps:
-            continue
-
-        grasps_native = np.stack(all_grasps, axis=0)
-        grasps_unified = map_to_unified(grasps_native, embodiment_id)
-        all_actions.append(grasps_unified)
-
-        scene_filename = f"{scene_name}.hdf5"
-        with h5py.File(str(output_dir / scene_filename), 'w') as hf:
-            hf.create_dataset('images', data=images_arr, compression='gzip', compression_opts=1)
-            hf.create_dataset('grasps', data=grasps_unified)
-            hf.create_dataset('action_mask', data=mask_info.mask)
-            obj_names = sorted(object_names)
-            lang = f"grasp the {obj_names[0]}" if obj_names else f"grasp object in {scene_name}"
-            hf.create_dataset('language', data=lang)
-            hf.attrs['dataset_name'] = 'dexgraspnet'
-            hf.attrs['embodiment_id'] = embodiment_id
-            hf.attrs['n_grasps'] = len(all_grasps)
-            hf.attrs['n_views'] = n_views
-            hf.attrs['image_size'] = 0  # original resolution; resize at training time
-
-        ep_metadata_list.append({'filename': scene_filename, 'length': 1, 'n_grasps': len(all_grasps)})
-
-    _write_metadata(output_dir, 'dexgraspnet', embodiment_id, True,
-                    [f'view_{i}' for i in range(8)], all_actions, ep_metadata_list)
-    total_grasps = sum(ep.get('n_grasps', 0) for ep in ep_metadata_list)
-    logger.info(f"  ✅ dexgraspnet: {len(ep_metadata_list)} scenes, {total_grasps} grasps → {output_dir}")
-    return True
-
-
-# =============================================================================
 # DexWild — download tar + extract → read source HDF5 → episode HDF5
 # =============================================================================
 
@@ -1128,6 +1052,374 @@ def prepare_dexwild(
 
 
 # =============================================================================
+# Dexora — multi-task LeRobot repo, each task is a sub-dataset
+# =============================================================================
+
+DEXORA_TASKS = [
+    'pick_yellow_egg', 'close_laptop_bimanual', 'stack_colored_square_blocks',
+    'fold_towel_bimanual', 'hammer_nail', 'open_box_lid_bimanual',
+    'place_cylinder_on_base', 'sweep_garbage_into_dustpan',
+    'turn_rubiks_cube_bimanual', 'cut_green_onion',
+]
+
+
+def prepare_dexora(
+    ds_info: dict,
+    output_dir: Path,
+    data_root: Path,
+    image_size: int = 448,
+    max_episodes: int = None,
+    **kwargs,
+):
+    """Download + convert Dexora tasks via LeRobot sub-dataset loading.
+
+    Dexora/Dexora_Real-World_Dataset is a multi-task repo where each task
+    is a proper LeRobot v2 dataset at dexora/{task_name}/.  We download
+    a subset of tasks and merge episodes into a single output directory.
+    """
+    from huggingface_hub import snapshot_download
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hf_repo = ds_info['hf_repo']
+
+    embodiment_id = DATASET_EMBODIMENT.get('dexora', 6)
+    native_dim = DATASET_NATIVE_ACTION_DIM.get('dexora', 39)
+    field_names = DATASET_FIELD_FORMATS.get('dexora')
+    mask_info = get_action_mask(embodiment_id, native_dim=native_dim, dataset_name='dexora')
+
+    all_actions = []
+    ep_metadata_list = []
+    ep_counter = 0
+    tasks_to_try = DEXORA_TASKS
+
+    for task_name in tasks_to_try:
+        if max_episodes and ep_counter >= max_episodes:
+            break
+
+        logger.info(f"  Dexora task: {task_name}")
+        task_prefix = f"dexora/{task_name}/"
+
+        try:
+            task_dir = data_root / 'dexora' / task_name
+            if not (task_dir / 'meta' / 'info.json').exists():
+                logger.info(f"    Downloading {task_name}...")
+                snapshot_download(
+                    repo_id=hf_repo, repo_type='dataset',
+                    local_dir=str(data_root / 'dexora_repo'),
+                    allow_patterns=[f"{task_prefix}**"],
+                )
+                import shutil
+                src = data_root / 'dexora_repo' / 'dexora' / task_name
+                if src.exists():
+                    task_dir.mkdir(parents=True, exist_ok=True)
+                    if task_dir != src:
+                        shutil.copytree(str(src), str(task_dir), dirs_exist_ok=True)
+
+            if not (task_dir / 'meta' / 'info.json').exists():
+                logger.warning(f"    Skipping {task_name}: no meta/info.json")
+                continue
+
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+            lerobot_ds = LeRobotDataset(
+                hf_repo, video_backend='pyav',
+                root=str(task_dir),
+            )
+        except Exception as e:
+            logger.warning(f"    Failed to load {task_name}: {e}")
+            try:
+                from datasets import load_dataset
+                parquet_dir = task_dir / 'data'
+                parquet_files = sorted(parquet_dir.rglob('*.parquet')) if parquet_dir.exists() else []
+                if not parquet_files:
+                    continue
+                hf_ds = load_dataset('parquet', data_files=[str(p) for p in parquet_files], split='train')
+                lerobot_ds = None
+            except Exception as e2:
+                logger.warning(f"    Also failed parquet fallback: {e2}")
+                continue
+
+        try:
+            if lerobot_ds is not None:
+                hf = lerobot_ds.hf_dataset
+            else:
+                hf = hf_ds
+
+            total_frames = len(hf)
+            logger.info(f"    {task_name}: {total_frames} frames")
+
+            episodes = defaultdict(list)
+            ep_col = hf['episode_index']
+            for i in range(total_frames):
+                episodes[int(ep_col[i])].append(i)
+
+            ep_ids = sorted(episodes.keys())
+            remaining = (max_episodes - ep_counter) if max_episodes else len(ep_ids)
+            ep_ids = ep_ids[:remaining]
+
+            for ep_id in tqdm(ep_ids, desc=f"    {task_name}", leave=False):
+                frame_indices = sorted(episodes[ep_id])
+                ep_len = len(frame_indices)
+
+                ep_filename = f"ep_{ep_counter:06d}.hdf5"
+                ep_path = output_dir / ep_filename
+
+                with h5py.File(str(ep_path), 'w') as hf_out:
+                    actions_native = np.zeros((ep_len, native_dim), dtype=np.float32)
+                    for t, fi in enumerate(frame_indices):
+                        act = hf[fi]['action']
+                        if act is not None:
+                            a = np.asarray(act).flatten().astype(np.float32)
+                            actions_native[t, :min(len(a), native_dim)] = a[:native_dim]
+
+                    if field_names:
+                        actions_unified, _ = assemble_state_vec_batch(actions_native, field_names)
+                    else:
+                        actions_unified = map_to_unified(actions_native, embodiment_id)
+                    hf_out.create_dataset('actions', data=actions_unified)
+                    all_actions.append(actions_unified)
+                    hf_out.create_dataset('action_mask', data=mask_info.mask)
+
+                    lang = task_name.replace('_', ' ')
+                    hf_out.create_dataset('language', data=lang)
+
+                    # Images: try video decode or per-frame
+                    n_views_written = 0
+                    if lerobot_ds is not None:
+                        sample0 = lerobot_ds[0]
+                        img_keys = [k for k in sample0.keys() if 'image' in k.lower()]
+                        for v_idx, img_key in enumerate(img_keys[:4]):
+                            images = []
+                            for fi in frame_indices:
+                                try:
+                                    s = lerobot_ds[fi]
+                                    iv = s.get(img_key)
+                                    if iv is not None:
+                                        img = _lerobot_to_numpy_image(iv)
+                                        if img is not None:
+                                            images.append(img)
+                                            continue
+                                except Exception:
+                                    pass
+                                if images:
+                                    images.append(np.zeros_like(images[0]))
+                            if images:
+                                images = [im for im in images if im is not None and isinstance(im, np.ndarray)]
+                                if images:
+                                    frames = np.stack(images).astype(np.uint8)
+                                    hf_out.create_dataset(
+                                        f'images/view_{n_views_written}', data=frames,
+                                        chunks=(1,) + frames.shape[1:],
+                                        compression='gzip', compression_opts=1,
+                                    )
+                                    n_views_written += 1
+
+                    hf_out.attrs['dataset_name'] = 'dexora'
+                    hf_out.attrs['embodiment_id'] = embodiment_id
+                    hf_out.attrs['episode_length'] = ep_len
+                    hf_out.attrs['n_views'] = n_views_written
+                    hf_out.attrs['action_dim'] = native_dim
+                    hf_out.attrs['image_size'] = 0
+
+                ep_metadata_list.append({'filename': ep_filename, 'length': ep_len})
+                ep_counter += 1
+
+                if max_episodes and ep_counter >= max_episodes:
+                    break
+
+        except Exception as e:
+            logger.warning(f"    Error processing {task_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    if not ep_metadata_list:
+        logger.error("  No Dexora episodes converted")
+        return False
+
+    _write_metadata(output_dir, 'dexora', embodiment_id, False,
+                    ['top', 'wrist_left', 'wrist_right', 'front'],
+                    all_actions, ep_metadata_list)
+    logger.info(f"  ✅ dexora: {len(ep_metadata_list)} episodes from {len(DEXORA_TASKS)} tasks → {output_dir}")
+    return True
+
+
+# =============================================================================
+# HF Generic — standard HuggingFace datasets (parquet/video, not LeRobot)
+# =============================================================================
+
+def prepare_hf_generic(
+    ds_name: str,
+    ds_info: dict,
+    output_dir: Path,
+    data_root: Path,
+    image_size: int = 448,
+    max_episodes: int = None,
+    **kwargs,
+):
+    """Download + convert a generic HuggingFace dataset (parquet with video).
+
+    For datasets like jxie/bridge_data_v2 where each row is one episode
+    with a 'video' column (video file) + 'text' column (language instruction).
+    Requires FFmpeg for video decoding.
+    """
+    from datasets import load_dataset
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hf_repo = ds_info['hf_repo']
+
+    logger.info(f"  Loading HF generic dataset: {hf_repo}")
+    try:
+        hf_ds = load_dataset(hf_repo, split='train')
+        total = len(hf_ds)
+        logger.info(f"  Loaded {total} episodes (video-per-row format)")
+    except Exception as e:
+        logger.error(f"  Failed to load {hf_repo}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    embodiment_id = DATASET_EMBODIMENT.get(ds_name, 0)
+    native_dim = DATASET_NATIVE_ACTION_DIM.get(ds_name, 7)
+    field_names = DATASET_FIELD_FORMATS.get(ds_name)
+    mask_info = get_action_mask(embodiment_id, native_dim=native_dim, dataset_name=ds_name)
+
+    n_episodes = min(max_episodes, total) if max_episodes else total
+    all_actions = []
+    ep_metadata_list = []
+
+    try:
+        import av
+    except ImportError:
+        logger.error("  pyav not installed — required for video decoding. pip install av")
+        return False
+
+    cols = hf_ds.column_names
+    has_video = 'video' in cols
+    has_text = 'text' in cols
+
+    if not has_video:
+        logger.warning("  No 'video' column — falling back to _convert_hf_dataset_to_episodes")
+        return _convert_hf_dataset_to_episodes(
+            hf_ds, ds_name, output_dir, image_size, max_episodes,
+        )
+
+    import io
+
+    # Get non-video columns for metadata access without triggering video decode
+    non_video_cols = [c for c in cols if c != 'video']
+    hf_ds_meta = hf_ds.select_columns(non_video_cols) if non_video_cols else None
+
+    # Access raw video bytes from the underlying Arrow table to avoid torchcodec
+    # HF datasets wraps parquet in Arrow; video column stores bytes directly
+    logger.info(f"  Columns: {cols}")
+    if has_video:
+        # Peek at first row to understand format
+        try:
+            raw_table = hf_ds.data  # pyarrow Table
+            video_col = raw_table.column('video')
+            first_chunk = video_col.chunk(0)
+            sample_val = first_chunk[0].as_py()
+            logger.info(f"  Video column raw type: {type(sample_val)}, "
+                        f"keys={list(sample_val.keys()) if isinstance(sample_val, dict) else 'N/A'}")
+        except Exception as e:
+            logger.info(f"  Could not peek video column: {e}")
+
+    for ep_num in tqdm(range(n_episodes), desc=f"  {ds_name}"):
+        try:
+            row = hf_ds_meta[ep_num] if hf_ds_meta else {}
+
+            # Read video bytes from raw Arrow table (bypasses torchcodec)
+            video_source = None
+            try:
+                raw_table = hf_ds.data
+                video_col = raw_table.column('video')
+                # Find which chunk contains this index
+                offset = 0
+                for chunk in video_col.chunks:
+                    if ep_num < offset + len(chunk):
+                        raw_val = chunk[ep_num - offset].as_py()
+                        break
+                    offset += len(chunk)
+                else:
+                    raw_val = None
+
+                if isinstance(raw_val, dict):
+                    if raw_val.get('bytes'):
+                        video_source = io.BytesIO(raw_val['bytes'])
+                    elif raw_val.get('path'):
+                        video_source = raw_val['path']
+                elif isinstance(raw_val, bytes):
+                    video_source = io.BytesIO(raw_val)
+                elif isinstance(raw_val, str):
+                    video_source = raw_val
+            except Exception as e:
+                logger.warning(f"  Ep {ep_num}: raw Arrow read failed: {e}")
+
+            if video_source is None:
+                if ep_num < 3:
+                    logger.warning(f"  Ep {ep_num}: no video source found")
+                continue
+
+            container = av.open(video_source)
+            stream = container.streams.video[0]
+            frames = []
+            for frame in container.decode(stream):
+                img = frame.to_ndarray(format='rgb24')
+                frames.append(img)
+            container.close()
+
+            ep_len = len(frames)
+            if ep_len == 0:
+                continue
+
+            ep_filename = f"ep_{ep_num:06d}.hdf5"
+            ep_path = output_dir / ep_filename
+
+            with h5py.File(str(ep_path), 'w') as hf_out:
+                img_arr = np.stack(frames).astype(np.uint8)
+                hf_out.create_dataset(
+                    'images/view_0', data=img_arr,
+                    chunks=(1,) + img_arr.shape[1:],
+                    compression='gzip', compression_opts=1,
+                )
+
+                actions_native = np.zeros((ep_len, native_dim), dtype=np.float32)
+                if field_names:
+                    actions_unified, _ = assemble_state_vec_batch(actions_native, field_names)
+                else:
+                    actions_unified = map_to_unified(actions_native, embodiment_id)
+                hf_out.create_dataset('actions', data=actions_unified)
+                all_actions.append(actions_unified)
+                hf_out.create_dataset('action_mask', data=mask_info.mask)
+
+                lang = row.get('text', '') if has_text else ''
+                hf_out.create_dataset('language', data=lang or '')
+
+                hf_out.attrs['dataset_name'] = ds_name
+                hf_out.attrs['embodiment_id'] = embodiment_id
+                hf_out.attrs['episode_length'] = ep_len
+                hf_out.attrs['n_views'] = 1
+                hf_out.attrs['action_dim'] = native_dim
+                hf_out.attrs['image_size'] = 0
+
+            ep_metadata_list.append({'filename': ep_filename, 'length': ep_len})
+
+        except Exception as e:
+            logger.warning(f"  Error processing episode {ep_num}: {e}")
+            continue
+
+    if not ep_metadata_list:
+        logger.error(f"  No {ds_name} episodes converted")
+        return False
+
+    view_names = DATASET_VIEW_NAMES.get(ds_name, ['view_0'])
+    _write_metadata(output_dir, ds_name, embodiment_id, False,
+                    view_names, all_actions, ep_metadata_list)
+    logger.info(f"  ✅ {ds_name}: {len(ep_metadata_list)} episodes → {output_dir}")
+    return True
+
+
+# =============================================================================
 # Metadata helper
 # =============================================================================
 
@@ -1170,8 +1462,9 @@ def _write_metadata(
 PREPARE_FN = {
     'lerobot': 'lerobot',
     'rlbench': 'rlbench',
-    'dexgraspnet': 'dexgraspnet',
     'dexwild': 'dexwild',
+    'dexora': 'dexora',
+    'hf_generic': 'hf_generic',
 }
 
 
@@ -1294,15 +1587,21 @@ def _prepare_single(ds_name: str, args) -> bool:
                 image_size=args.image_size,
                 max_episodes=args.max_episodes,
             )
-        elif ds_type == 'dexgraspnet':
-            ok = prepare_dexgraspnet(
+        elif ds_type == 'dexwild':
+            ok = prepare_dexwild(
                 ds_info, output_dir, data_root,
                 image_size=args.image_size,
                 max_episodes=args.max_episodes,
             )
-        elif ds_type == 'dexwild':
-            ok = prepare_dexwild(
+        elif ds_type == 'dexora':
+            ok = prepare_dexora(
                 ds_info, output_dir, data_root,
+                image_size=args.image_size,
+                max_episodes=args.max_episodes,
+            )
+        elif ds_type == 'hf_generic':
+            ok = prepare_hf_generic(
+                ds_name, ds_info, output_dir, data_root,
                 image_size=args.image_size,
                 max_episodes=args.max_episodes,
             )

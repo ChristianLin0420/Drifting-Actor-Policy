@@ -196,11 +196,6 @@ DATASET_FIELD_FORMATS = {
         'gripper_open',
         'base_vel_x',
     ],
-    'dexgraspnet': [
-        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
-        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
-        *[f'dex_finger_joint_{i}_pos' for i in range(16)],
-    ],
     'dexwild': [
         'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
         'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
@@ -217,6 +212,56 @@ DATASET_FIELD_FORMATS = {
         *[f'dex_finger_joint_{i}_pos' for i in range(12)],
         # Head + spine [45:48]
         'head_joint_0', 'head_joint_1', 'spine_joint',
+    ],
+    # ── Open X-Embodiment additions (LeRobot format) ──
+    'bridgev2': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+        'gripper_open',
+    ],
+    'kuka': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+        'gripper_open',
+        'base_vel_x', 'base_vel_y', 'base_angular_vel',
+    ],
+    'berkeley_fanuc': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+    ],
+    'cmu_play_fusion': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+        'gripper_open',
+    ],
+    'jaco_play': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+    ],
+    'austin_buds': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+        'gripper_open',
+    ],
+    'austin_sailor': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+        'eef_angle_4', 'eef_angle_5',
+        'gripper_open',
+    ],
+    'austin_sirius': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+        'eef_angle_4', 'eef_angle_5',
+        'gripper_open',
+    ],
+    'columbia_pusht': [
+        'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+        'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+    ],
+    'nyu_door': [
+        'eef_vel_x', 'eef_vel_y', 'eef_vel_z',
+        'eef_angular_vel_roll', 'eef_angular_vel_pitch', 'eef_angular_vel_yaw',
+        'gripper_open',
     ],
 }
 
@@ -323,14 +368,23 @@ DATASET_EMBODIMENT = {
     'aloha': EMBODIMENT_BIMANUAL,
     'nyu_franka': EMBODIMENT_BIMANUAL,
     **{f'behavior1k_t{i:04d}': EMBODIMENT_BIMANUAL_MOBILE for i in range(50)},
-    'dexgraspnet': EMBODIMENT_DEXHAND,
     'dexwild': EMBODIMENT_DEXHAND,
     'dexora': EMBODIMENT_BIMANUAL_DEX,
+    # Open X-Embodiment additions
+    'bridgev2': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'kuka': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'berkeley_fanuc': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'cmu_play_fusion': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'jaco_play': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'austin_buds': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'austin_sailor': EMBODIMENT_GRIPPER_EEF,
+    'austin_sirius': EMBODIMENT_GRIPPER_EEF,
+    'columbia_pusht': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'nyu_door': EMBODIMENT_GRIPPER_DELTA_EEF,
 }
 
 DATASET_HF_REPOS = {
     'rlbench': 'hqfang/rlbench-18-tasks',
-    'dexgraspnet': 'lhrlhr/DexGraspNet2.0',
     'aloha': 'lerobot/aloha_sim_transfer_cube_human_image',
     'droid': 'lerobot/droid_1.0.1',
     'bc_z': 'lerobot/berkeley_autolab_ur5',
@@ -342,6 +396,17 @@ DATASET_HF_REPOS = {
     **{f'behavior1k_t{i:04d}': f'lerobot/behavior1k-task{i:04d}' for i in range(50)},
     'dexwild': 'boardd/dexwild-dataset',
     'dexora': 'Dexora/Dexora_Real-World_Dataset',
+    # Open X-Embodiment additions (verified against huggingface.co/collections/lerobot/open-x-embodiment)
+    'bridgev2': 'jxie/bridge_data_v2',
+    'kuka': 'lerobot/stanford_kuka_multimodal_dataset',
+    'berkeley_fanuc': 'lerobot/berkeley_fanuc_manipulation',
+    'cmu_play_fusion': 'lerobot/cmu_play_fusion',
+    'jaco_play': 'lerobot/jaco_play',
+    'austin_buds': 'lerobot/austin_buds_dataset',
+    'austin_sailor': 'lerobot/austin_sailor_dataset',
+    'austin_sirius': 'lerobot/austin_sirius_dataset',
+    'columbia_pusht': 'lerobot/columbia_cairlab_pusht_real',
+    'nyu_door': 'lerobot/nyu_door_opening_surprising_effectiveness',
 }
 
 LEROBOT_DATASETS = {
@@ -350,11 +415,14 @@ LEROBOT_DATASETS = {
     'nyu_franka', 'stanford_hydra',
     *{f'behavior1k_t{i:04d}' for i in range(50)},
     'dexora',
+    # Open X-Embodiment additions
+    'kuka', 'berkeley_fanuc', 'cmu_play_fusion', 'jaco_play',
+    'austin_buds', 'austin_sailor', 'austin_sirius',
+    'columbia_pusht', 'nyu_door',
 }
 
 DATASET_NATIVE_ACTION_DIM = {
     'rlbench': 8,
-    'dexgraspnet': 23,
     'aloha': 14,
     'droid': 7,
     'bc_z': 7,
@@ -366,11 +434,21 @@ DATASET_NATIVE_ACTION_DIM = {
     **{f'behavior1k_t{i:04d}': 23 for i in range(50)},
     'dexwild': 23,
     'dexora': 39,
+    # Open X-Embodiment additions
+    'bridgev2': 8,
+    'kuka': 11,
+    'berkeley_fanuc': 7,
+    'cmu_play_fusion': 8,
+    'jaco_play': 3,
+    'austin_buds': 8,
+    'austin_sailor': 10,
+    'austin_sirius': 10,
+    'columbia_pusht': 7,
+    'nyu_door': 7,
 }
 
 DATASET_ACTION_FORMAT = {
     'rlbench': 'absolute_ee',
-    'dexgraspnet': 'absolute_ee',
     'aloha': 'absolute_joints',
     'droid': 'joint_position',
     'bc_z': 'joint_position',
@@ -382,6 +460,17 @@ DATASET_ACTION_FORMAT = {
     **{f'behavior1k_t{i:04d}': 'absolute_joints' for i in range(50)},
     'dexwild': 'absolute_ee',
     'dexora': 'absolute_joints',
+    # Open X-Embodiment additions
+    'bridgev2': 'delta_ee',
+    'kuka': 'delta_ee',
+    'berkeley_fanuc': 'delta_ee',
+    'cmu_play_fusion': 'delta_ee',
+    'jaco_play': 'delta_ee',
+    'austin_buds': 'delta_ee',
+    'austin_sailor': 'absolute_ee',
+    'austin_sirius': 'absolute_ee',
+    'columbia_pusht': 'delta_ee',
+    'nyu_door': 'ee_velocity',
 }
 
 
@@ -483,6 +572,16 @@ def get_action_mask(embodiment_id: int, native_dim: Optional[int] = None,
         # Extra
         if nd > 19:
             mask[39:39 + min(nd - 19, 4)] = True
+        return ActionMaskInfo(mask=mask, active_dims=int(mask.sum()), native_dim=nd, quat_dims=None)
+
+    elif embodiment_id == EMBODIMENT_BIMANUAL_DEX:
+        # Left arm [50:56] + right arm [0:6]
+        mask[50:56] = True
+        mask[0:6] = True
+        # Left dex fingers [115:127] + right dex fingers [103:115]
+        mask[103:127] = True
+        # Head + spine [45:48]
+        mask[45:48] = True
         return ActionMaskInfo(mask=mask, active_dims=int(mask.sum()), native_dim=nd, quat_dims=None)
 
     else:

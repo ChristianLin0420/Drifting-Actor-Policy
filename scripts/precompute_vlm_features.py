@@ -148,14 +148,6 @@ def load_dataset_for_precompute(dataset_name: str, data_root: str):
             action_horizon=1,
         )
 
-    elif dataset_name == 'dexgraspnet':
-        from drifting_vla.data.dexgraspnet_dataset import DexGraspNetDataset
-        return DexGraspNetDataset(
-            data_dir=str(data_dir),
-            image_size=448,
-            action_horizon=1,
-        )
-
     elif dataset_name in LEROBOT_DATASETS:
         from drifting_vla.data.lerobot_dataset import LeRobotDataset
         hf_repo = DATASET_HF_REPOS.get(dataset_name)
@@ -168,7 +160,7 @@ def load_dataset_for_precompute(dataset_name: str, data_root: str):
         )
 
     else:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Available: rlbench, dexgraspnet, {', '.join(LEROBOT_DATASETS)}")
+        raise ValueError(f"Unknown dataset: {dataset_name}. Available: rlbench, {', '.join(LEROBOT_DATASETS)}")
 
 
 def main():
@@ -189,7 +181,7 @@ def main():
 
     if args.all:
         from drifting_vla.data.action_mapping import LEROBOT_DATASETS
-        datasets_to_process = ['rlbench', 'dexgraspnet'] + sorted(LEROBOT_DATASETS)
+        datasets_to_process = ['rlbench'] + sorted(LEROBOT_DATASETS)
     elif args.dataset:
         datasets_to_process = [args.dataset]
     else:

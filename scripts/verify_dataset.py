@@ -8,8 +8,6 @@ Checks:
   - Language non-empty
   - Actions correct dimensionality
   - Action mapping round-trip
-  - DexGraspNet: rendered images exist
-
 Usage:
     python scripts/verify_dataset.py --dataset aloha
     python scripts/verify_dataset.py --all
@@ -148,61 +146,6 @@ def verify_rlbench_dataset(data_root='./data'):
     return True
 
 
-def verify_dexgraspnet_dataset(data_root='./data'):
-    """Verify DexGraspNet dataset."""
-    from drifting_vla.data.dexgraspnet_dataset import DexGraspNetDataset
-    import numpy as np
-
-    ds_dir = Path(data_root) / 'dexgraspnet'
-    errors = []
-
-    # Check scenes exist
-    scenes_dir = ds_dir / 'scenes'
-    if not scenes_dir.exists():
-        errors.append("No scenes directory")
-    else:
-        n_scenes = sum(1 for d in scenes_dir.iterdir() if d.is_dir() and d.name.startswith('scene_'))
-        logger.info(f"  Scenes: {n_scenes} ✓")
-
-    # Check meshdata
-    mesh_dir = ds_dir / 'meshdata'
-    if not mesh_dir.exists():
-        errors.append("No meshdata directory (needed for rendering)")
-    else:
-        n_meshes = sum(1 for d in mesh_dir.iterdir() if d.is_dir())
-        logger.info(f"  Meshes: {n_meshes} objects ✓")
-
-    # Check rendered images
-    rendered_dir = ds_dir / 'rendered'
-    if rendered_dir.exists():
-        n_rendered = sum(1 for _ in rendered_dir.rglob('*.png')) // 8
-        logger.info(f"  Rendered: {n_rendered} scenes ✓")
-    else:
-        logger.warning(f"  Rendered: not yet (will auto-render on next download)")
-
-    # Load and check samples
-    ds = DexGraspNetDataset(data_dir=str(ds_dir), max_samples=10, image_size=448)
-    if len(ds) == 0:
-        errors.append("0 samples loaded")
-    else:
-        logger.info(f"  Samples: {len(ds)} ✓")
-        s = ds[0]
-        logger.info(f"  Images: {s['images'].shape}, lang={repr(s['language'][:50])}")
-        logger.info(f"  Actions: {s['actions'].shape}")
-
-        # Verify action is 23-dim
-        if s['actions'].shape[1] != 23:
-            errors.append(f"Action dim {s['actions'].shape[1]} != 23")
-
-    if errors:
-        for e in errors:
-            logger.error(f"  ✗ {e}")
-        return False
-
-    logger.info(f"  ✅ dexgraspnet PASSED")
-    return True
-
-
 def main():
     parser = argparse.ArgumentParser(description='Verify dataset integrity')
     parser.add_argument('--dataset', type=str, default=None)
@@ -213,7 +156,7 @@ def main():
     from drifting_vla.data.action_mapping import LEROBOT_DATASETS
 
     if args.all:
-        datasets = ['rlbench'] + sorted(LEROBOT_DATASETS) + ['dexgraspnet']
+        datasets = ['rlbench'] + sorted(LEROBOT_DATASETS)
     elif args.dataset:
         datasets = [args.dataset]
     else:
@@ -228,8 +171,6 @@ def main():
 
         if ds == 'rlbench':
             results[ds] = verify_rlbench_dataset(args.data_root)
-        elif ds == 'dexgraspnet':
-            results[ds] = verify_dexgraspnet_dataset(args.data_root)
         elif ds in LEROBOT_DATASETS:
             results[ds] = verify_lerobot_dataset(ds, args.data_root)
         else:

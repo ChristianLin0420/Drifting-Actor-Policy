@@ -9,7 +9,6 @@ Features:
   - Episode-aware temporal sampling (real consecutive action chunks)
   - Multi-frame history (t-1, t, t+1) with guaranteed same-episode frames
   - LRU file handle cache for efficient HDF5 access
-  - Supports both temporal episodes and static scenes (DexGraspNet)
   - Vision-encoder-only VLM preprocessing (no chat template, no PIL conversion loops)
 
 VLM Preprocessing (Pi0 style):
@@ -27,13 +26,6 @@ HDF5 layout (temporal):
   ├── language       scalar string
   └── attrs: {dataset_name, embodiment_id, episode_length, n_views, ...}
 
-HDF5 layout (DexGraspNet scene):
-  scene_XXXX.hdf5
-  ├── images/        [8, H, W, 3] uint8   (8 rendered views)
-  ├── grasps/        [K, 128] float32      (K grasps, pre-mapped)
-  ├── action_mask    [128] bool
-  ├── object_names/  [N] strings
-  └── attrs: {n_grasps, n_views}
 """
 
 import json
@@ -102,7 +94,6 @@ class EpisodeHDF5Dataset(Dataset):
         self.dataset_name = self.metadata.get('dataset_name', self.episode_dir.name)
         self.embodiment_id = self.metadata.get('embodiment_id', 0)
         self.view_names = self.metadata.get('view_names', ['view_0'])
-        self.is_static = self.metadata.get('is_static', False)
 
         # Build sample index
         self.sample_index = self._build_sample_index()
@@ -117,30 +108,19 @@ class EpisodeHDF5Dataset(Dataset):
         logger.info(
             f"EpisodeHDF5Dataset({self.dataset_name}): "
             f"{len(self.sample_index)} samples from "
-            f"{len(self.metadata.get('episodes', []))} episodes, "
-            f"static={self.is_static}"
+            f"{len(self.metadata.get('episodes', []))} episodes"
         )
 
     def _build_sample_index(self) -> List[Tuple[str, int]]:
         """Build index: each entry = (episode_file_path, start_timestep)."""
         index = []
 
-        if self.is_static:
-            # DexGraspNet: each entry = (scene_file, grasp_idx)
-            for ep_info in self.metadata.get('episodes', []):
-                ep_file = str(self.episode_dir / ep_info['filename'])
-                n_grasps = ep_info.get('n_grasps', ep_info.get('length', 1))
-                for g in range(n_grasps):
-                    index.append((ep_file, g))
-        else:
-            # Temporal: each entry = (episode_file, start_timestep)
-            for ep_info in self.metadata.get('episodes', []):
-                ep_file = str(self.episode_dir / ep_info['filename'])
-                ep_len = ep_info['length']
-                # Valid starting points
-                max_start = max(1, ep_len - self.action_horizon + 1)
-                for t in range(0, max_start, self.stride):
-                    index.append((ep_file, t))
+        for ep_info in self.metadata.get('episodes', []):
+            ep_file = str(self.episode_dir / ep_info['filename'])
+            ep_len = ep_info['length']
+            max_start = max(1, ep_len - self.action_horizon + 1)
+            for t in range(0, max_start, self.stride):
+                index.append((ep_file, t))
 
         return index
 
@@ -173,10 +153,7 @@ class EpisodeHDF5Dataset(Dataset):
                 ep_file, t_start = self.sample_index[idx]
                 f = self._get_file(ep_file)
 
-                if self.is_static:
-                    sample = self._load_static(f, t_start, idx)
-                else:
-                    sample = self._load_temporal(f, t_start, idx)
+                sample = self._load_temporal(f, t_start, idx)
 
                 return self._preprocess_vlm(sample)
             except Exception as e:
@@ -188,7 +165,7 @@ class EpisodeHDF5Dataset(Dataset):
         logger.error(f"All 5 retry attempts failed, falling back to sample 0")
         ep_file, t_start = self.sample_index[0]
         f = self._get_file(ep_file)
-        sample = self._load_temporal(f, t_start, 0) if not self.is_static else self._load_static(f, t_start, 0)
+        sample = self._load_temporal(f, t_start, 0)
         return self._preprocess_vlm(sample)
 
     def _load_temporal(self, f: h5py.File, t_start: int, idx: int) -> dict:
@@ -260,41 +237,6 @@ class EpisodeHDF5Dataset(Dataset):
             'task_id': 0,
         }
 
-    def _load_static(self, f: h5py.File, grasp_idx: int, idx: int) -> dict:
-        """Load static scene sample (DexGraspNet)."""
-        n_views = f.attrs.get('n_views', 8)
-        T = self.action_horizon
-
-        # ── Action: single grasp, tiled T times ──
-        grasp = f['grasps'][grasp_idx]  # [128]
-        actions = np.tile(grasp[np.newaxis, :], (T, 1))  # [T, 128]
-        action_mask = f['action_mask'][:]  # [128]
-
-        # ── Images: all views, 1 frame ──
-        images = self._load_images_static(f, n_views)
-
-        # ── Language ──
-        language = self._read_language(f)
-
-        # ── No proprio for static grasps ──
-        proprio = np.zeros(128, dtype=np.float32)
-
-        return {
-            'images': torch.from_numpy(images).float(),
-            'actions': torch.from_numpy(actions.astype(np.float32)),
-            'action_mask': torch.from_numpy(action_mask.astype(np.float32)),
-            'language': language,
-            'proprio': torch.from_numpy(proprio),
-            'embodiment_id': int(f.attrs.get('embodiment_id', self.embodiment_id)),
-            'dataset_name': self.dataset_name,
-            'num_views': int(n_views),
-            'num_frames': 1,
-            'episode_id': idx,
-            'timestep': 0,
-            'sample_id': idx,
-            'task_id': 0,
-        }
-
     def _load_images(
         self, f: h5py.File, frame_indices: List[int], n_views: int
     ) -> np.ndarray:
@@ -324,29 +266,6 @@ class EpisodeHDF5Dataset(Dataset):
                         images.append(np.zeros((3, self.image_size, self.image_size), dtype=np.float32))
 
         return np.stack(images, axis=0)  # [F*V, 3, H, W] or [F, 3, H, W] if no views
-
-    def _load_images_static(self, f: h5py.File, n_views: int) -> np.ndarray:
-        """Load all views for static scene (1 frame)."""
-        images = []
-        if 'images' in f and hasattr(f['images'], 'shape'):
-            all_imgs = f['images'][:]  # [V, H, W, 3]
-            for v in range(min(n_views, all_imgs.shape[0])):
-                img = self._preprocess_image(all_imgs[v])
-                images.append(img)
-        else:
-            for v in range(n_views):
-                key = f'images/view_{v}'
-                if key in f:
-                    img = f[key][0] if f[key].ndim == 4 else f[key][:]
-                    img = self._preprocess_image(img)
-                    images.append(img)
-                else:
-                    images.append(np.zeros((3, self.image_size, self.image_size), dtype=np.float32))
-
-        if not images:
-            images = [np.zeros((3, self.image_size, self.image_size), dtype=np.float32)]
-
-        return np.stack(images, axis=0)
 
     def _preprocess_image(self, img: np.ndarray) -> np.ndarray:
         """Convert [H, W, 3] uint8 → [3, image_size, image_size] float32 [0, 1].
@@ -400,15 +319,6 @@ class EpisodeHDF5Dataset(Dataset):
             if isinstance(val, bytes):
                 return val.decode('utf-8')
             return str(val)
-
-        if 'object_names' in f:
-            try:
-                names = [n.decode('utf-8') if isinstance(n, bytes) else str(n)
-                         for n in f['object_names'][:]]
-                if names:
-                    return f"grasp the {names[0]}"
-            except Exception:
-                pass
 
         return ""
 

@@ -49,7 +49,7 @@ transformer:
 # Note: RLBench uses 8-dim actions (3 pos + 4 quat + 1 gripper)
 action_decoder:
   hidden_dim: 768
-  action_horizon: 16
+  action_horizon: 64
   position_dim: 3
   rotation_dim: 4
   gripper_dim: 1
@@ -59,7 +59,7 @@ action_decoder:
 
 # Global Settings
 hidden_dim: 768
-action_horizon: 16
+action_horizon: 64
 noise_dim: 64
 cfg_scale_range: [1.0, 4.0]
 cfg_dropout: 0.1

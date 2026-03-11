@@ -27,7 +27,7 @@
 #       -e WANDB_API_KEY=$WANDB_API_KEY \
 #       drifting-vla:pretrain \
 #       torchrun --nproc_per_node=8 scripts/train.py \
-#           --datasets aloha bc_z behavior1k_t0000 cmu_stretch dexgraspnet \
+#           --datasets aloha bc_z behavior1k_t0000 cmu_stretch \
 #               dexwild nyu_franka rlbench stanford_hydra taco_play utaustin_mutex \
 #           --episodes-root ./data/episodes \
 #           --batch-size 32 --grad-accumulation 2 \
@@ -75,6 +75,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # X11 for headless rendering
     xvfb \
     x11-utils \
+    # FFmpeg (required for video decoding: bridgev2, behavior1k, etc.)
+    ffmpeg \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libswscale-dev \
+    libswresample-dev \
     # HDF5 and compression
     libhdf5-dev \
     liblz4-dev \
@@ -134,7 +141,9 @@ RUN pip install --no-cache-dir \
 # =============================================================================
 RUN pip install --no-cache-dir \
     "opencv-python-headless>=4.9" \
-    "Pillow>=10.2"
+    "Pillow>=10.2" \
+    av \
+    torchcodec
 
 # =============================================================================
 # Visualization + Logging

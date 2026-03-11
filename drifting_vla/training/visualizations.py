@@ -8,12 +8,12 @@ Panels (Training):
   viz/A1_drifting_field        — Drift vectors on actual pred→GT space
   viz/A2_drift_magnitude_trend — λ_V convergence with EMA smoothing
   viz/A3_prediction_scatter    — Pred vs GT ALL dims, ALL timesteps (dense scatter)
-  viz/A4_per_dim_error_bar     — ALL active dims (0-55) error bar chart
+  viz/A4_full_128_error         — Full 128-dim error heatmap (active + inactive)
   viz/A5_temperature_loss      — Temperature loss with trend comparison
   viz/B1_action_distribution   — ALL active dims violin/histogram grid
   viz/B2_action_error_heatmap  — ALL active dims × Timestep heatmap
   viz/B3_per_region_summary    — Per-region aggregated error radar
-  viz/B4_trajectory_2d         — Clear 2D multi-panel trajectories (GT vs Pred)
+  viz/B4_trajectory_3d         — 3D EEF trajectory (GT vs Pred with error lines)
   viz/B5_temporal_error_curve  — Error evolution across action horizon
   viz/C1_sample_transport      — PCA-projected transport with magnitude colormap
   viz/C2_mode_coverage         — Coverage + correlation matrix
@@ -21,6 +21,18 @@ Panels (Training):
 
 Panels (Evaluation):
   viz/D1_eval_dashboard        — Per-dataset eval bar charts
+  viz/D2_training_curves       — Loss / MSE / drift over time
+  viz/D3_dataset_learning_curves — Per-dataset MSE convergence
+  viz/D4_data_balance          — Sampling distribution pie + bar
+
+Panels (Pretraining Diagnostics):
+  viz/E1_embodiment_convergence — Per-embodiment MSE over training steps
+  viz/E2_gradient_flow          — Gradient L2 norms per param group
+  viz/E3_queue_health           — Pos/neg queue fill levels
+  viz/E4_kernel_diagnostics     — Kernel weight entropy per temperature
+
+Panels (VLA Diagnostics):
+  viz/F1_cross_attention_map    — DiT→VLM cross-attention heatmap
 """
 
 import torch
@@ -38,6 +50,7 @@ try:
     from matplotlib.colors import LinearSegmentedColormap, Normalize
     from matplotlib.patches import Patch
     from matplotlib.lines import Line2D
+    from mpl_toolkits.mplot3d import Axes3D
     HAS_MPL = True
 except ImportError:
     HAS_MPL = False
@@ -54,14 +67,37 @@ COLORS = {
 }
 
 REGION_DEFS = [
-    (0, 8,   'EEF',      '#3498db'),
-    (8, 16,  'Joint',    '#9b59b6'),
-    (16, 32, 'Bimanual', '#2ecc71'),
-    (32, 48, 'DexHand',  '#e74c3c'),
-    (48, 56, 'Base',     '#f39c12'),
+    (0, 10,   'R.ArmJ',     '#3498db'),
+    (10, 15,  'R.Grip',     '#2980b9'),
+    (15, 25,  'R.ArmV',     '#8e44ad'),
+    (25, 30,  'R.GripV',    '#9b59b6'),
+    (30, 33,  'R.EEFp',     '#27ae60'),
+    (33, 39,  'R.EEFr',     '#2ecc71'),
+    (39, 42,  'R.EEFv',     '#1abc9c'),
+    (42, 45,  'R.EEFw',     '#16a085'),
+    (45, 50,  'Head',       '#f1c40f'),
+    (50, 60,  'L.ArmJ',     '#e67e22'),
+    (60, 65,  'L.Grip',     '#d35400'),
+    (65, 75,  'L.ArmV',     '#e74c3c'),
+    (75, 80,  'L.GripV',    '#c0392b'),
+    (80, 83,  'L.EEFp',     '#1abc9c'),
+    (83, 89,  'L.EEFr',     '#16a085'),
+    (89, 92,  'L.EEFv',     '#2c3e50'),
+    (92, 95,  'L.EEFw',     '#34495e'),
+    (95, 100, 'Rsvd',       '#95a5a6'),
+    (100, 103,'Base',       '#f39c12'),
+    (103, 115,'R.DexF',     '#e74c3c'),
+    (115, 127,'L.DexF',     '#c0392b'),
+    (127, 128,'Rsvd2',      '#bdc3c7'),
 ]
 
 REGION_NAMES = {(s, e): n for s, e, n, _ in REGION_DEFS}
+
+# Human-readable label for every dim index [0..127]
+DIM_LABELS = {}
+for _s, _e, _n, _ in REGION_DEFS:
+    for _i in range(_s, _e):
+        DIM_LABELS[_i] = f'{_n}[{_i - _s}]'
 
 
 def _setup_style():
@@ -156,6 +192,10 @@ class VizLogger:
         self._eval_history = {}  # {ds_name: {'steps': [], 'mse': [], 'mae': [], 'corr': []}}
         # For D4: data balance tracking
         self._dataset_batch_counts = {}  # {ds_name: count}
+        # For E4: gradient flow tracking
+        self._grad_history = {}  # {group_name: [(step, norm), ...]}
+        # For E-series: per-embodiment tracking
+        self._per_emb_mse_history = {}  # {emb_name: [(step, mse), ...]}
 
     def log_training_viz(
         self,
@@ -209,7 +249,7 @@ class VizLogger:
                 pred, gt, active_dims, dim_labels, step)))
 
         if step % 500 == 0 and n_active >= 1:
-            panels.append(('viz/A4_per_dim_error_bar', lambda: self._plot_A4(
+            panels.append(('viz/A4_full_128_error', lambda: self._plot_A4(
                 pred, gt, active_dims, dim_labels, step)))
 
         if per_temp_losses and step % 500 == 0:
@@ -229,7 +269,7 @@ class VizLogger:
                 pred, gt, active_dims, step)))
 
         if step % 1000 == 0 and n_active >= 2 and B >= 2:
-            panels.append(('viz/B4_trajectory_2d', lambda: self._plot_B4(
+            panels.append(('viz/B4_trajectory_3d', lambda: self._plot_B4(
                 pred, gt, active_dims, step)))
 
         if step % 500 == 0 and T >= 2:
@@ -256,62 +296,96 @@ class VizLogger:
             except Exception as e:
                 logger.warning(f"Viz {panel_key} error at step {step}: {e}")
 
+        # Inactive dim energy scalar (should be ~0)
+        inactive_mask = ~union_mask
+        if inactive_mask.any():
+            inactive_energy = float((pred[:, :, inactive_mask] ** 2).mean())
+            log_dict['train/inactive_dim_energy'] = inactive_energy
+
         if log_dict:
             wandb.log(log_dict, step=step)
 
     # ──────────────────────────────────────────────────────────────
-    # A1: Drifting Field — arrows from pred to pred+V on actual data
+    # A1: Drifting Field — multi-panel analysis
     # ──────────────────────────────────────────────────────────────
     def _plot_A1(self, pred, gt, drift_field, active_dims, step):
+        """Multi-panel drift field: per-dim heatmap, PCA, per-region bar, magnitude hist."""
         B, T, D = pred.shape
-        d0, d1 = active_dims[0], active_dims[min(1, len(active_dims)-1)]
-
-        # drift_field is [N_emb, T*D] (per-embodiment subset, flattened)
-        # Clip n to the smaller of batch size and drift_field rows
         n_drift = drift_field.shape[0]
-        n = min(B, n_drift, 60)
+        n = min(B, n_drift, 100)
         if n < 2:
             return None
 
-        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        fig = plt.figure(figsize=(20, 10))
+        gs = gridspec.GridSpec(2, 2, hspace=0.35, wspace=0.3)
 
-        ax = axes[0]
-        x = pred[:n, 0, d0]
-        y = pred[:n, 0, d1]
-
-        # drift_field is flattened [N, T*D]; extract dim d0 at timestep 0
+        # Panel 1: Per-dim drift magnitude heatmap [samples x 128]
+        ax1 = fig.add_subplot(gs[0, 0])
+        # drift_field is [N, T*D]; reshape to [N, D] using first timestep
         flat_D = drift_field.shape[1]
-        dx = drift_field[:n, d0] if d0 < flat_D else np.zeros(n)
-        dy = drift_field[:n, d1] if d1 < flat_D else np.zeros(n)
-        mag = np.sqrt(dx**2 + dy**2 + 1e-12)
-        max_mag = mag.max() + 1e-8
-        scale_factor = 0.3 * (np.abs(x).max() + np.abs(y).max() + 0.01) / max_mag
+        if flat_D >= D:
+            drift_per_dim = np.abs(drift_field[:n, :D])  # [n, D] first T=0
+        else:
+            drift_per_dim = np.abs(drift_field[:n])
+            pad = np.zeros((n, D - flat_D))
+            drift_per_dim = np.concatenate([drift_per_dim, pad], axis=1)
 
-        ax.scatter(gt[:n, 0, d0], gt[:n, 0, d1], s=50, c=COLORS['accent'], marker='*',
-                   alpha=0.6, label='GT', zorder=3)
-        ax.scatter(x, y, s=30, c=COLORS['gt'], alpha=0.5, label='Pred', zorder=2)
-        for i in range(n):
-            ax.annotate('', xy=(x[i] + dx[i]*scale_factor, y[i] + dy[i]*scale_factor),
-                        xytext=(x[i], y[i]),
-                        arrowprops=dict(arrowstyle='->', color=plt.cm.coolwarm(mag[i]/max_mag),
-                                       lw=1.5, alpha=0.7))
-        ax.set_xlabel(f'Dim {d0} ({_dim_label_short(d0)})')
-        ax.set_ylabel(f'Dim {d1} ({_dim_label_short(d1)})')
-        ax.set_title(f'Drift Vectors (pred → pred+V) | {n} samples')
-        ax.legend()
+        im = ax1.imshow(drift_per_dim, aspect='auto', cmap='hot', interpolation='nearest')
+        for s, e, name, color in REGION_DEFS:
+            ax1.axvline(s - 0.5, color=color, linewidth=0.5, alpha=0.5)
+        ax1.set_xlabel('Action Dim [0-127]')
+        ax1.set_ylabel('Sample')
+        ax1.set_title('Per-Dim Drift |V_d|', fontsize=10, fontweight='bold')
+        plt.colorbar(im, ax=ax1, fraction=0.02, label='|V|')
 
-        ax = axes[1]
+        # Panel 2: PCA 2D projection of drift vectors
+        ax2 = fig.add_subplot(gs[0, 1])
+        from sklearn.decomposition import PCA
+        try:
+            pca = PCA(n_components=2)
+            proj = pca.fit_transform(drift_field[:n])
+            mag = np.linalg.norm(drift_field[:n], axis=1)
+            sc = ax2.scatter(proj[:, 0], proj[:, 1], c=mag, cmap='viridis',
+                            s=20, alpha=0.7)
+            plt.colorbar(sc, ax=ax2, fraction=0.02, label='|V|')
+            ax2.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})')
+            ax2.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})')
+        except Exception:
+            ax2.text(0.5, 0.5, 'PCA failed', transform=ax2.transAxes, ha='center')
+        ax2.set_title('PCA of Drift Vectors', fontsize=10, fontweight='bold')
+
+        # Panel 3: Per-region mean drift bar chart
+        ax3 = fig.add_subplot(gs[1, 0])
+        region_means = []
+        region_names = []
+        region_colors = []
+        for s, e, name, color in REGION_DEFS:
+            if e <= drift_per_dim.shape[1]:
+                val = drift_per_dim[:, s:e].mean()
+            else:
+                val = 0
+            region_means.append(val)
+            region_names.append(name)
+            region_colors.append(color)
+        bars = ax3.barh(range(len(region_means)), region_means, color=region_colors, alpha=0.8)
+        ax3.set_yticks(range(len(region_names)))
+        ax3.set_yticklabels(region_names, fontsize=7)
+        ax3.set_xlabel('Mean |V|')
+        ax3.set_title('Per-Region Drift Magnitude', fontsize=10, fontweight='bold')
+        ax3.invert_yaxis()
+
+        # Panel 4: Drift magnitude histogram
+        ax4 = fig.add_subplot(gs[1, 1])
         all_mag = np.linalg.norm(drift_field[:n], axis=1)
-        ax.hist(all_mag, bins=25, color=COLORS['gt'], alpha=0.8, edgecolor='white')
-        ax.axvline(all_mag.mean(), color=COLORS['pred'], linestyle='--', linewidth=2.5,
-                   label=f'Mean |V| = {all_mag.mean():.4f}')
-        ax.set_xlabel('Drift Magnitude |V|')
-        ax.set_ylabel('Count')
-        ax.set_title('Drift Magnitude Distribution')
-        ax.legend()
+        ax4.hist(all_mag, bins=30, color=COLORS['gt'], alpha=0.8, edgecolor='white')
+        ax4.axvline(all_mag.mean(), color=COLORS['pred'], linestyle='--', linewidth=2.5,
+                    label=f'Mean |V| = {all_mag.mean():.4f}')
+        ax4.set_xlabel('Drift Magnitude |V|')
+        ax4.set_ylabel('Count')
+        ax4.set_title('Magnitude Distribution', fontsize=10, fontweight='bold')
+        ax4.legend()
 
-        fig.suptitle(f'A1: Drifting Field — Step {step}', fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        fig.suptitle(f'A1: Drifting Field Analysis — Step {step}', fontsize=14, fontweight='bold')
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
@@ -433,51 +507,56 @@ class VizLogger:
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # A4: Per-Dim Error — ALL active dims, full bar chart 0-55
+    # A4: Full 128-Dim Error Heatmap — active (warm) + inactive (gray)
     # ──────────────────────────────────────────────────────────────
     def _plot_A4(self, pred, gt, active_dims, dim_labels, step):
-        """Show MAE for EVERY active dimension — no truncation."""
+        """Full 128-dim error heatmap: active dims (warm) + inactive dims (gray)."""
         B, T, D = pred.shape
-        mae_all = np.abs(pred - gt).mean(axis=(0, 1))  # [D]
-        n = len(active_dims)
-        vals = mae_all[active_dims]
+        error = np.abs(pred - gt).mean(axis=0)  # [T, D] averaged over batch
+        pred_energy = (pred ** 2).mean(axis=0)   # [T, D] for inactive dims
 
-        fig_h = max(5, n * 0.28)
-        fig, ax = plt.subplots(figsize=(12, fig_h))
+        fig, ax = plt.subplots(figsize=(20, 6))
 
-        colors = [_dim_color(d) for d in active_dims]
-        y_pos = np.arange(n)
+        # Build composite heatmap: active=error, inactive=energy (separate colormaps)
+        active_mask_1d = np.zeros(D, dtype=bool)
+        active_mask_1d[active_dims] = True
 
-        bars = ax.barh(y_pos, vals, color=colors, alpha=0.85, edgecolor='white', height=0.72)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels([f'd{d:2d} {dim_labels[i]}' for i, d in enumerate(active_dims)],
-                           fontsize=7, fontfamily='monospace')
+        # Active dims error
+        active_data = np.where(active_mask_1d[np.newaxis, :], error, np.nan)
+        im1 = ax.imshow(active_data, aspect='auto', cmap='YlOrRd',
+                        interpolation='nearest', alpha=0.9)
 
-        max_v = vals.max() if len(vals) > 0 else 1
-        for bar, v in zip(bars, vals):
-            ax.text(bar.get_width() + max_v * 0.015, bar.get_y() + bar.get_height() / 2,
-                    f'{v:.4f}', va='center', fontsize=6, fontfamily='monospace')
+        # Inactive dims energy (overlay with gray colormap)
+        inactive_data = np.where(~active_mask_1d[np.newaxis, :], pred_energy, np.nan)
+        im2 = ax.imshow(inactive_data, aspect='auto', cmap='Greys',
+                        interpolation='nearest', alpha=0.7)
 
-        ax.axvline(vals.mean(), color='black', linestyle='--', linewidth=1.5, alpha=0.5,
-                   label=f'Mean = {vals.mean():.4f}')
-        ax.axvline(np.median(vals), color=COLORS['accent'], linestyle=':', linewidth=1.5, alpha=0.5,
-                   label=f'Median = {np.median(vals):.4f}')
+        # Region boundary lines and labels
+        for s, e, name, color in REGION_DEFS:
+            ax.axvline(s - 0.5, color=color, linewidth=0.8, alpha=0.6)
+            mid = (s + e) / 2
+            if e - s >= 3:
+                ax.text(mid, -0.8, name, ha='center', va='bottom', fontsize=6,
+                        color=color, fontweight='bold', rotation=45)
 
-        for start, end, name, color in REGION_DEFS:
-            in_region = [i for i, d in enumerate(active_dims) if start <= d < end]
-            if in_region:
-                mid = (in_region[0] + in_region[-1]) / 2
-                ax.text(max_v * 1.12, mid, name, fontsize=8, fontweight='bold',
-                        color=color, va='center', ha='left')
-
-        ax.legend(loc='lower right', fontsize=8)
-        ax.set_xlabel('Mean Absolute Error (all timesteps)', fontsize=10)
-        worst_i = np.argmax(vals)
-        ax.set_title(f'A4: Per-Dimension Error (all {n} active dims) — Step {step}\n'
-                     f'Worst: d{active_dims[worst_i]} {dim_labels[worst_i]} = {vals[worst_i]:.4f}',
+        ax.set_xlabel('Action Dimension [0-127]')
+        ax.set_ylabel('Timestep')
+        ax.set_title(f'A4: Full 128-Dim Error Map — Step {step}\n'
+                     f'Warm=Active Error | Gray=Inactive Energy (should be ~0)',
                      fontsize=11, fontweight='bold')
-        ax.invert_yaxis()
-        ax.set_xlim(0, max_v * 1.25)
+
+        # Colorbars
+        cbar1 = plt.colorbar(im1, ax=ax, pad=0.02, fraction=0.02, label='Active |error|')
+        cbar2 = plt.colorbar(im2, ax=ax, pad=0.06, fraction=0.02, label='Inactive |pred|²')
+
+        # Stats annotation
+        active_err = error[:, active_dims].mean()
+        inactive_energy = pred_energy[:, ~active_mask_1d].mean() if (~active_mask_1d).any() else 0.0
+        ax.text(0.01, 0.95, f'Active MAE: {active_err:.4f}\n'
+                f'Inactive Energy: {inactive_energy:.6f}',
+                transform=ax.transAxes, fontsize=9, va='top',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+
         plt.tight_layout()
         return fig_to_wandb_image(fig)
 
@@ -736,69 +815,73 @@ class VizLogger:
         return fig_to_wandb_image(fig)
 
     # ──────────────────────────────────────────────────────────────
-    # B4: Trajectory 2D — Clear multi-panel with error ribbons
-    # (FIXED: replaced confusing 3D with clean 2D per-sample view)
+    # B4: 3D Trajectory — EEF position with physical units
     # ──────────────────────────────────────────────────────────────
     def _plot_B4(self, pred, gt, active_dims, step):
-        """2D multi-panel trajectory: XY + XZ views per sample with error lines."""
+        """3D trajectory: EEF position (X/Y/Z) with physical units."""
         B, T, D = pred.shape
-        if len(active_dims) < 2:
-            return fig_to_wandb_image(plt.figure())
 
-        d0 = active_dims[0]
-        d1 = active_dims[min(1, len(active_dims) - 1)]
-        d2 = active_dims[min(2, len(active_dims) - 1)] if len(active_dims) >= 3 else d0
+        # Prefer EEF position dims [30,31,32] (right arm) if active
+        eef_dims = [30, 31, 32]
+        eef_active = all(d in active_dims for d in eef_dims)
+
+        if not eef_active:
+            # Fallback: left EEF [80,81,82]
+            eef_dims = [80, 81, 82]
+            eef_active = all(d in active_dims for d in eef_dims)
+
+        if not eef_active:
+            # Final fallback: first 3 active dims
+            if len(active_dims) < 3:
+                return None
+            eef_dims = list(active_dims[:3])
+
+        axis_labels = {
+            30: 'X (m)', 31: 'Y (m)', 32: 'Z (m)',
+            80: 'L.X (m)', 81: 'L.Y (m)', 82: 'L.Z (m)',
+        }
+        xl = axis_labels.get(eef_dims[0], f'Dim {eef_dims[0]}')
+        yl = axis_labels.get(eef_dims[1], f'Dim {eef_dims[1]}')
+        zl = axis_labels.get(eef_dims[2], f'Dim {eef_dims[2]}')
+
         n_show = min(4, B)
-
-        fig, axes = plt.subplots(2, n_show, figsize=(4.5 * n_show, 8),
-                                 squeeze=False)
+        rows = 2 if n_show > 2 else 1
+        cols = min(n_show, 2)
+        fig = plt.figure(figsize=(7 * cols, 6 * rows))
 
         for i in range(n_show):
-            # ── Top row: d0 vs d1 (e.g. X vs Y) ──
-            ax = axes[0, i]
-            ax.plot(gt[i, :, d0], gt[i, :, d1], '-o', color=COLORS['gt'],
-                    markersize=3, linewidth=2, alpha=0.8, label='GT', zorder=3)
-            ax.plot(pred[i, :, d0], pred[i, :, d1], '--s', color=COLORS['pred'],
-                    markersize=3, linewidth=1.5, alpha=0.7, label='Pred', zorder=2)
-            # Error lines connecting GT↔Pred at each timestep
+            ax = fig.add_subplot(rows, cols, i + 1, projection='3d')
+
+            gx, gy, gz = gt[i, :, eef_dims[0]], gt[i, :, eef_dims[1]], gt[i, :, eef_dims[2]]
+            px, py, pz = pred[i, :, eef_dims[0]], pred[i, :, eef_dims[1]], pred[i, :, eef_dims[2]]
+
+            ax.plot(gx, gy, gz, '-o', color=COLORS['gt'], markersize=2,
+                    linewidth=2, alpha=0.8, label='GT')
+            ax.plot(px, py, pz, '--s', color=COLORS['pred'], markersize=2,
+                    linewidth=1.5, alpha=0.7, label='Pred')
+
+            # Error lines at each timestep
             for t in range(T):
-                ax.plot([gt[i, t, d0], pred[i, t, d0]],
-                        [gt[i, t, d1], pred[i, t, d1]],
-                        '-', color='gray', alpha=0.3, linewidth=0.8, zorder=1)
+                ax.plot([gx[t], px[t]], [gy[t], py[t]], [gz[t], pz[t]],
+                        '-', color='gray', alpha=0.3, linewidth=0.6)
+
             # Start/end markers
-            ax.scatter(gt[i, 0, d0], gt[i, 0, d1], s=80, c=COLORS['accent'],
+            ax.scatter(*[gx[0]], *[gy[0]], *[gz[0]], s=80, c=COLORS['accent'],
                        marker='^', zorder=5, label='Start')
-            ax.scatter(gt[i, -1, d0], gt[i, -1, d1], s=80, c=COLORS['warn'],
+            ax.scatter(*[gx[-1]], *[gy[-1]], *[gz[-1]], s=80, c=COLORS['warn'],
                        marker='v', zorder=5, label='End')
 
-            err = np.abs(pred[i, :, [d0, d1]] - gt[i, :, [d0, d1]]).mean()
-            ax.set_title(f'Sample {i} | MAE={err:.4f}', fontsize=9, fontweight='bold')
-            ax.set_xlabel(f'd{d0} ({_dim_label_short(d0)})', fontsize=8)
-            ax.set_ylabel(f'd{d1} ({_dim_label_short(d1)})', fontsize=8)
+            pos_err = np.sqrt(((gt[i, :, eef_dims] - pred[i, :, eef_dims]) ** 2).sum(axis=1)).mean()
+            ax.set_xlabel(xl, fontsize=8)
+            ax.set_ylabel(yl, fontsize=8)
+            ax.set_zlabel(zl, fontsize=8)
+            ax.set_title(f'Sample {i} | Pos MAE={pos_err:.4f}', fontsize=9, fontweight='bold')
             if i == 0:
-                ax.legend(fontsize=7, loc='best')
+                ax.legend(fontsize=7, loc='upper left')
 
-            # ── Bottom row: d0 vs d2 (e.g. X vs Z) ──
-            ax2 = axes[1, i]
-            ax2.plot(gt[i, :, d0], gt[i, :, d2], '-o', color=COLORS['gt'],
-                     markersize=3, linewidth=2, alpha=0.8, zorder=3)
-            ax2.plot(pred[i, :, d0], pred[i, :, d2], '--s', color=COLORS['pred'],
-                     markersize=3, linewidth=1.5, alpha=0.7, zorder=2)
-            for t in range(T):
-                ax2.plot([gt[i, t, d0], pred[i, t, d0]],
-                         [gt[i, t, d2], pred[i, t, d2]],
-                         '-', color='gray', alpha=0.3, linewidth=0.8, zorder=1)
-            ax2.scatter(gt[i, 0, d0], gt[i, 0, d2], s=80, c=COLORS['accent'],
-                        marker='^', zorder=5)
-            ax2.scatter(gt[i, -1, d0], gt[i, -1, d2], s=80, c=COLORS['warn'],
-                        marker='v', zorder=5)
-            ax2.set_xlabel(f'd{d0} ({_dim_label_short(d0)})', fontsize=8)
-            ax2.set_ylabel(f'd{d2} ({_dim_label_short(d2)})', fontsize=8)
-
-        avg_err = np.abs(pred[:n_show] - gt[:n_show]).mean()
-        fig.suptitle(f'B4: Action Trajectories (2D views, gray=error) — Step {step} | '
-                     f'Avg Error: {avg_err:.4f}',
-                     fontsize=12, fontweight='bold')
+        dims_name = 'R.EEF' if eef_dims[0] == 30 else ('L.EEF' if eef_dims[0] == 80 else 'Top-3')
+        fig.suptitle(f'B4: 3D Trajectory ({dims_name}) — Step {step}',
+                     fontsize=13, fontweight='bold')
         plt.tight_layout()
         return fig_to_wandb_image(fig)
 
@@ -1439,5 +1522,183 @@ def create_data_balance_monitor(
 
     fig.suptitle(f'D4: Data Balance Monitor — Step {step}',
                  fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    return fig_to_wandb_image(fig)
+
+
+# ══════════════════════════════════════════════════════════════
+# E1: Per-Embodiment Convergence
+# ══════════════════════════════════════════════════════════════
+
+def create_embodiment_convergence(per_emb_history: dict, step: int):
+    """Line plot of MSE over steps for each embodiment type."""
+    if not HAS_MPL or not per_emb_history:
+        return None
+    _setup_style()
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    cmap = plt.cm.tab10
+    for i, (emb_name, records) in enumerate(sorted(per_emb_history.items())):
+        if not records:
+            continue
+        steps = [r[0] for r in records]
+        mses = [r[1] for r in records]
+        color = cmap(i / max(len(per_emb_history), 1))
+        ax.plot(steps, mses, '-o', color=color, markersize=3, linewidth=1.8,
+                label=f'{emb_name} ({mses[-1]:.4f})', alpha=0.8)
+
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('MSE')
+    ax.set_title(f'E1: Per-Embodiment MSE Convergence — Step {step}',
+                 fontsize=12, fontweight='bold')
+    ax.legend(fontsize=8, loc='upper right')
+    if any(len(r) > 0 and r[-1][1] > 0 for r in per_emb_history.values() if r):
+        ax.set_yscale('log')
+    plt.tight_layout()
+    return fig_to_wandb_image(fig)
+
+
+# ══════════════════════════════════════════════════════════════
+# E2: Gradient Flow Monitor
+# ══════════════════════════════════════════════════════════════
+
+def create_gradient_flow(grad_history: dict, step: int):
+    """Gradient L2 norms for VLM LoRA, Projector, DiT over time."""
+    if not HAS_MPL or not grad_history:
+        return None
+    _setup_style()
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    group_colors = {'vlm_lora': '#e74c3c', 'projector': '#f39c12', 'dit': '#3498db'}
+
+    for group_name, records in sorted(grad_history.items()):
+        if not records:
+            continue
+        steps = [r[0] for r in records]
+        norms = [r[1] for r in records]
+        color = group_colors.get(group_name, '#95a5a6')
+        ax.plot(steps, norms, '-', color=color, linewidth=1.5,
+                label=f'{group_name} ({norms[-1]:.4f})', alpha=0.8)
+
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Gradient L2 Norm')
+    ax.set_title(f'E2: Gradient Flow — Step {step}', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.set_yscale('log')
+    plt.tight_layout()
+    return fig_to_wandb_image(fig)
+
+
+# ══════════════════════════════════════════════════════════════
+# E3: Queue Health Monitor
+# ══════════════════════════════════════════════════════════════
+
+def create_queue_health(pos_queue_size: int, neg_queue_size: int,
+                        pos_queue_max: int, neg_queue_max: int, step: int):
+    """Queue fill levels as gauge bars."""
+    if not HAS_MPL:
+        return None
+    _setup_style()
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    for ax, name, cur, mx in [
+        (axes[0], 'Positive Queue', pos_queue_size, pos_queue_max),
+        (axes[1], 'Negative Queue', neg_queue_size, neg_queue_max),
+    ]:
+        pct = cur / max(mx, 1) * 100
+        color = COLORS['accent'] if pct > 50 else COLORS['warn'] if pct > 10 else COLORS['pred']
+        ax.barh(0, pct, height=0.5, color=color, alpha=0.8)
+        ax.barh(0, 100, height=0.5, color='#ecf0f1', alpha=0.3, zorder=0)
+        ax.set_xlim(0, 105)
+        ax.set_yticks([])
+        ax.set_xlabel('Fill %')
+        ax.set_title(f'{name}: {cur}/{mx} ({pct:.0f}%)', fontsize=10, fontweight='bold')
+
+    fig.suptitle(f'E3: Queue Health — Step {step}', fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    return fig_to_wandb_image(fig)
+
+
+# ══════════════════════════════════════════════════════════════
+# E4: Kernel Entropy Diagnostics
+# ══════════════════════════════════════════════════════════════
+
+def create_kernel_diagnostics(kernel_entropies: dict, step: int):
+    """Kernel weight entropy per temperature — detects too-sharp or too-flat kernels.
+
+    kernel_entropies: {tau: [(step, entropy), ...]}
+    """
+    if not HAS_MPL or not kernel_entropies:
+        return None
+    _setup_style()
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    tau_colors = {0.02: '#e74c3c', 0.05: '#f39c12', 0.2: '#3498db'}
+
+    for tau, records in sorted(kernel_entropies.items()):
+        if not records:
+            continue
+        steps = [r[0] for r in records]
+        entropies = [r[1] for r in records]
+        color = tau_colors.get(tau, '#95a5a6')
+        ax.plot(steps, entropies, '-o', color=color, markersize=3, linewidth=1.5,
+                label=f'τ={tau} (H={entropies[-1]:.2f})', alpha=0.8)
+
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Kernel Weight Entropy H')
+    ax.set_title(f'E4: Kernel Diagnostics — Step {step}\n'
+                 f'H→0 = one-hot (too sharp) | H→log(N) = uniform (too flat)',
+                 fontsize=11, fontweight='bold')
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    return fig_to_wandb_image(fig)
+
+
+# ══════════════════════════════════════════════════════════════
+# F1: Cross-Attention Heatmap (VLM tokens ← DiT noise tokens)
+# ══════════════════════════════════════════════════════════════
+
+def create_cross_attention_map(attn_weights, num_views: int, num_frames: int, step: int):
+    """Visualize which VLM tokens the DiT attends to.
+
+    attn_weights: [action_tokens, vlm_tokens] averaged over batch and heads
+    """
+    if not HAS_MPL or attn_weights is None:
+        return None
+    _setup_style()
+
+    if isinstance(attn_weights, torch.Tensor):
+        attn = attn_weights.detach().cpu().float().numpy()
+    else:
+        attn = np.array(attn_weights)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    im = ax.imshow(attn, aspect='auto', cmap='Blues', interpolation='nearest')
+    ax.set_ylabel('Action Token (t=0..T)')
+    ax.set_xlabel('VLM Token')
+    ax.set_title(f'F1: Cross-Attention Map — Step {step}\n'
+                 f'Which VLM tokens does DiT attend to?',
+                 fontsize=11, fontweight='bold')
+    plt.colorbar(im, ax=ax, fraction=0.02, label='Attention Weight')
+
+    # Annotate image/language boundaries (approximate)
+    total_tokens = attn.shape[1]
+    if num_views > 0 and num_frames > 0:
+        img_tokens = total_tokens - 128  # rough: last ~128 are language
+        if img_tokens > 0:
+            tokens_per_img = img_tokens // max(num_views * num_frames, 1)
+            for g in range(num_views * num_frames):
+                pos = g * tokens_per_img
+                frame_idx = g // num_views
+                cam_idx = g % num_views
+                ax.axvline(pos, color='white', linewidth=0.5, alpha=0.5)
+                if tokens_per_img > 10:
+                    ax.text(pos + 2, -0.5, f'f{frame_idx}c{cam_idx}', fontsize=6,
+                            color='white', va='bottom')
+            ax.axvline(img_tokens, color='yellow', linewidth=1.5, alpha=0.7)
+            ax.text(img_tokens + 2, -0.5, 'Language→', fontsize=8,
+                    color='yellow', va='bottom', fontweight='bold')
+
     plt.tight_layout()
     return fig_to_wandb_image(fig)
