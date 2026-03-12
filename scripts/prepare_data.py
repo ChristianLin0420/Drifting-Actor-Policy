@@ -1422,36 +1422,46 @@ def prepare_dexora(
                     lang = task_name.replace('_', ' ')
                     hf_out.create_dataset('language', data=lang)
 
-                    # Images: try video decode or per-frame
+                    # Images: decode videos from task folder
+                    # Dexora v2.1 video path: videos/chunk-{chunk:03d}/{camera_key}/episode_{ep:06d}.mp4
                     n_views_written = 0
-                    if lerobot_ds is not None:
-                        sample0 = lerobot_ds[0]
-                        img_keys = [k for k in sample0.keys() if 'image' in k.lower()]
-                        for v_idx, img_key in enumerate(img_keys[:4]):
-                            images = []
-                            for fi in frame_indices:
-                                try:
-                                    s = lerobot_ds[fi]
-                                    iv = s.get(img_key)
-                                    if iv is not None:
-                                        img = _lerobot_to_numpy_image(iv)
-                                        if img is not None:
-                                            images.append(img)
-                                            continue
-                                except Exception:
-                                    pass
-                                if images:
-                                    images.append(np.zeros_like(images[0]))
-                            if images:
-                                images = [im for im in images if im is not None and isinstance(im, np.ndarray)]
-                                if images:
-                                    frames = np.stack(images).astype(np.uint8)
-                                    hf_out.create_dataset(
-                                        f'images/view_{n_views_written}', data=frames,
-                                        chunks=(1,) + frames.shape[1:],
-                                        compression='gzip', compression_opts=1,
-                                    )
-                                    n_views_written += 1
+                    import av as _av
+                    DEXORA_CAMERAS = [
+                        'observation.images.top',
+                        'observation.images.wrist_left',
+                        'observation.images.wrist_right',
+                        'observation.images.front',
+                    ]
+                    chunks_size = 1000
+                    for cam_key in DEXORA_CAMERAS:
+                        chunk_idx = ep_id // chunks_size
+                        file_idx = ep_id % chunks_size
+                        video_path = (task_dir / 'videos' /
+                                      f'chunk-{chunk_idx:03d}' / cam_key /
+                                      f'episode_{file_idx:06d}.mp4')
+                        if not video_path.exists():
+                            continue
+                        try:
+                            container = _av.open(str(video_path))
+                            stream = container.streams.video[0]
+                            cam_frames = []
+                            for frame in container.decode(stream):
+                                cam_frames.append(frame.to_ndarray(format='rgb24'))
+                                if len(cam_frames) >= ep_len:
+                                    break
+                            container.close()
+                            if cam_frames:
+                                while len(cam_frames) < ep_len:
+                                    cam_frames.append(cam_frames[-1].copy())
+                                arr = np.stack(cam_frames[:ep_len]).astype(np.uint8)
+                                hf_out.create_dataset(
+                                    f'images/view_{n_views_written}', data=arr,
+                                    chunks=(1,) + arr.shape[1:],
+                                    compression='gzip', compression_opts=1,
+                                )
+                                n_views_written += 1
+                        except Exception as ve:
+                            logger.debug(f"      Video decode failed for {cam_key}: {ve}")
 
                     hf_out.attrs['dataset_name'] = 'dexora'
                     hf_out.attrs['embodiment_id'] = embodiment_id
