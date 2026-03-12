@@ -38,34 +38,33 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Skipped: droid, dexwild
-# Done: aloha, cmu_stretch
+# Skipped: droid, dexwild, rlbench
+# Done: aloha, cmu_stretch, dexora, bc_z, nyu_franka
 
 # All datasets
 ALL_DATASETS=(
     # Original
-    bc_z taco_play stanford_hydra utaustin_mutex
-    nyu_franka rlbench dexora
+    taco_play stanford_hydra utaustin_mutex
     # Behavior 1K
-    $(for i in $(seq -w 0 49); do echo "behavior1k_t00$i"; done)
+    # $(for i in $(seq -w 0 49); do echo "behavior1k_t00$i"; done)
     # OXE batch 1
     bridgev2 kuka berkeley_fanuc cmu_play_fusion jaco_play
     austin_buds austin_sailor austin_sirius columbia_pusht nyu_door
-    # ALOHA Static
-    aloha_static_cups_open aloha_static_vinh_cup aloha_static_vinh_cup_left
-    aloha_static_coffee aloha_static_pingpong aloha_static_tape
-    aloha_static_pro_pencil aloha_static_candy aloha_static_fork
-    aloha_static_velcro aloha_static_battery aloha_static_screw
-    aloha_static_towel aloha_static_ziploc
-    # ALOHA Mobile
-    aloha_mobile_cabinet aloha_mobile_chair aloha_mobile_wash_pan
-    aloha_mobile_wipe_wine aloha_mobile_elevator aloha_mobile_shrimp
-    # OXE batch 2
-    berkeley_rpt toto stanford_robocook berkeley_mvp kaist_nonprehensile
-    ucsd_pick_place ucsd_kitchen asu_table_top utokyo_pr2_fridge
-    utokyo_pr2_tabletop utokyo_xarm_bimanual tokyo_u_lsmo
-    dlr_sara_grid dlr_sara_pour dlr_edan nyu_rot
-    usc_cloth_sim cmu_franka_exploration imperialcollege_sawyer
+    # # ALOHA Static
+    # aloha_static_cups_open aloha_static_vinh_cup aloha_static_vinh_cup_left
+    # aloha_static_coffee aloha_static_pingpong aloha_static_tape
+    # aloha_static_pro_pencil aloha_static_candy aloha_static_fork
+    # aloha_static_velcro aloha_static_battery aloha_static_screw
+    # aloha_static_towel aloha_static_ziploc
+    # # ALOHA Mobile
+    # aloha_mobile_cabinet aloha_mobile_chair aloha_mobile_wash_pan
+    # aloha_mobile_wipe_wine aloha_mobile_elevator aloha_mobile_shrimp
+    # # OXE batch 2
+    # berkeley_rpt toto stanford_robocook berkeley_mvp kaist_nonprehensile
+    # ucsd_pick_place ucsd_kitchen asu_table_top utokyo_pr2_fridge
+    # utokyo_pr2_tabletop utokyo_xarm_bimanual tokyo_u_lsmo
+    # dlr_sara_grid dlr_sara_pour dlr_edan nyu_rot
+    # usc_cloth_sim cmu_franka_exploration imperialcollege_sawyer
 )
 
 TOTAL=${#ALL_DATASETS[@]}
