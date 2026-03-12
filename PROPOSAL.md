@@ -770,8 +770,7 @@ Complete profiling of all 26 datasets (12 original + 10 OXE + 4 Behavior1K shown
 
 | Dataset | HF Repo | Frames | Act Dim | Embodiment | Ctrl Hz | Action Format | HF Size | HDF5 Est. | Prep Time |
 |---------|---------|--------|---------|------------|---------|---------------|---------|-----------|-----------|
-| behavior1k_t0000 | `lerobot/behavior1k-task0000` | ~430K | 23 | bimanual_mobile | 30 | abs joints+base | ~5.7 GB | ~3 GB | 2 hrs |
-| behavior1k_t0001-t0049 | `lerobot/behavior1k-task{0001-0049}` | ~430K ea | 23 | bimanual_mobile | 30 | abs joints+base | ~5 GB ea | ~3 GB ea | ~2 hrs ea |
+| behavior1k_t0001-t0049 | `lerobot/behavior1k-task{0000-0049}` | ~430K ea | 23 | bimanual_mobile | 30 | abs joints+base | ~5 GB ea | ~3 GB ea | ~2 hrs ea |
 | **Behavior1K subtotal** | 50 tasks | **~21.5M** | | | | | **~255 GB** | **~150 GB** | **~100 hrs** |
 
 #### Totals and Disk Planning
