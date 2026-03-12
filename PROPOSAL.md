@@ -674,31 +674,127 @@ Speed estimation basis:
 - 8×A40 baseline: ~0.2 steps/s (measured, batch=32/gpu, accum=2)
 - 64×H200: ~2.5 steps/s (8× more GPUs × 2× H200 speed × 1.5× Flash Attn, batch=64/gpu)
 
-### 12.5 Data Preparation: Dataset Sizes and Time
+### 12.5 Data Preparation: Full Dataset Profiling
 
-Actual download + HDF5 conversion estimates based on verified HuggingFace dataset sizes:
+Complete profiling of all 26 datasets (12 original + 10 OXE + 4 Behavior1K shown) with action space details, control frequencies, and preparation estimates.
 
-| Dataset | Episodes | Frames | HF Download | HDF5 Output | Est. Prep Time |
-|---------|----------|--------|-------------|-------------|---------------|
-| aloha | 50 | 20K | ~0.5 GB | ~0.3 GB | 5 min |
-| bc_z | 1,000 | 98K | ~76 GB | ~15 GB | 6 hrs |
-| taco_play | 3,603 | 238K | ~48 GB | ~8 GB | 10 hrs |
-| stanford_hydra | 600 | 358K | ~25 GB | ~5 GB | 8 hrs |
-| cmu_stretch | 135 | 25K | ~3 GB | ~0.5 GB | 30 min |
-| droid | 76,000 | 25.5M | **~1.7 TB** (RLDS) | ~300 GB | ~3 days |
-| utaustin_mutex | 1,500 | 362K | ~30 GB | ~6 GB | 6 hrs |
-| nyu_franka | 450 | 45K | ~8 GB | ~2 GB | 2 hrs |
-| rlbench | 2,700 | 270K | ~116 GB | ~20 GB | 4 hrs |
-| dexwild | 9,500 | 95K | ~30 GB | ~8 GB | 4 hrs |
-| dexora | 12,200 | 2.9M | ~150 GB (est) | ~50 GB | 12 hrs |
-| behavior1k ×50 | ~100 ea | ~430K ea | ~5 GB ea | ~3 GB ea | ~2 hrs ea |
-| **Total** | | **~35M** | **~2.8 TB** | **~600 GB** | |
+#### Original Datasets
 
-**Wall time with `--parallel 5`:** ~2-3 days (bottleneck: DROID at 1.7 TB).
+| Dataset | HF Repo | Frames | Act Dim | Embodiment | Ctrl Hz | Action Format | HF Size | HDF5 Est. | Prep Time |
+|---------|---------|--------|---------|------------|---------|---------------|---------|-----------|-----------|
+| aloha | `lerobot/aloha_sim_..._human_image` | 20K | 14 | bimanual | 50 | abs joints | ~0.5 GB | ~0.3 GB | 5 min |
+| bc_z | `lerobot/berkeley_autolab_ur5` | 98K | 7 | gripper_joint | 10 | joint pos | ~76 GB | ~15 GB | 6 hrs |
+| taco_play | `lerobot/taco_play` | 238K | 7 | gripper_joint | 15 | joint pos | ~48 GB | ~8 GB | 10 hrs |
+| stanford_hydra | `lerobot/stanford_hydra_dataset` | 358K | 7 | delta_eef | 10 | delta EE | ~25 GB | ~5 GB | 8 hrs |
+| cmu_stretch | `lerobot/cmu_stretch` | 25K | 8 | delta_eef | 10 | delta EE | ~3 GB | ~0.5 GB | 30 min |
+| utaustin_mutex | `lerobot/utaustin_mutex` | 362K | 7 | delta_eef | 20 | delta EE | ~30 GB | ~6 GB | 6 hrs |
+| nyu_franka | `lerobot/nyu_franka_play_dataset` | 45K | 15 | bimanual | 3 | abs joints | ~8 GB | ~2 GB | 2 hrs |
+| droid | `lerobot/droid_1.0.1` | 25.5M | 7 | gripper_joint | 15 | joint pos | **~1.7 TB** | ~300 GB | ~3 days |
+| rlbench | `hqfang/rlbench-18-tasks` | 270K | 8 | gripper_eef | 20 | abs EE | ~116 GB | ~20 GB | 4 hrs |
+| dexwild | `boardd/dexwild-dataset` | 95K | 23 | dex_hand | 30 | abs EE+fingers | ~215 GB | ~8 GB | 4 hrs |
+| dexora | `Dexora/Dexora_Real-World_Dataset` | 2.9M | 39 | bimanual_dex | 20 | abs joints+fingers | ~150 GB | ~50 GB | 12 hrs |
 
-**Disk requirement:** ~3.4 TB peak (HF cache + HDF5 output). With `--cleanup` flag, HF cache is removed after each dataset, reducing peak to ~2 TB.
+#### Open X-Embodiment Additions
 
-**Note:** The DROID dataset is by far the largest (1.7 TB download, 76K episodes). For initial experiments, use `--max-episodes 1000` to limit to ~1% of DROID (~20 GB download).
+| Dataset | HF Repo | Frames | Act Dim | Embodiment | Ctrl Hz | Action Format | HF Size | HDF5 Est. | Prep Time |
+|---------|---------|--------|---------|------------|---------|---------------|---------|-----------|-----------|
+| bridgev2 | `jxie/bridge_data_v2` | 53K ep | 8 | delta_eef | 5 | delta EE+grip | ~28 GB | ~10 GB | 3 hrs |
+| kuka | `lerobot/stanford_kuka_multimodal_dataset` | 150K | 11 | delta_eef | 10 | delta EE+base | ~15 GB | ~3 GB | 2 hrs |
+| berkeley_fanuc | `lerobot/berkeley_fanuc_manipulation` | 63K | 7 | delta_eef | 10 | delta EE | ~8 GB | ~1.5 GB | 1 hr |
+| cmu_play_fusion | `lerobot/cmu_play_fusion` | 236K | 8 | delta_eef | 5 | delta EE+grip | ~20 GB | ~4 GB | 3 hrs |
+| jaco_play | `lerobot/jaco_play` | 78K | 3 | delta_eef | 10 | delta pos (3D) | ~5 GB | ~1 GB | 30 min |
+| austin_buds | `lerobot/austin_buds_dataset` | 34K | 8 | delta_eef | 20 | delta EE+grip | ~4 GB | ~0.8 GB | 30 min |
+| austin_sailor | `lerobot/austin_sailor_dataset` | 353K | 10 | gripper_eef | 20 | abs EE+6Drot | ~30 GB | ~5 GB | 4 hrs |
+| austin_sirius | `lerobot/austin_sirius_dataset` | 280K | 10 | gripper_eef | 20 | abs EE+6Drot | ~25 GB | ~4 GB | 3 hrs |
+| columbia_pusht | `lerobot/columbia_cairlab_pusht_real` | 28K | 7 | delta_eef | 10 | delta EE | ~3 GB | ~0.5 GB | 20 min |
+| nyu_door | `lerobot/nyu_door_opening_...` | 20K | 7 | delta_eef | 3 | EE velocity | ~2 GB | ~0.4 GB | 15 min |
+
+#### ALOHA Static Variants (14 tasks, same robot)
+
+| Dataset | HF Repo | Frames | Act Dim | Embodiment | Ctrl Hz | HDF5 Est. |
+|---------|---------|--------|---------|------------|---------|-----------|
+| aloha_static_cups_open | `lerobot/aloha_static_cups_open` | 20K | 14 | bimanual | 50 | ~0.3 GB |
+| aloha_static_vinh_cup | `lerobot/aloha_static_vinh_cup` | 45.5K | 14 | bimanual | 50 | ~0.7 GB |
+| aloha_static_vinh_cup_left | `lerobot/aloha_static_vinh_cup_left` | 50K | 14 | bimanual | 50 | ~0.8 GB |
+| aloha_static_coffee | `lerobot/aloha_static_coffee` | 55K | 14 | bimanual | 50 | ~0.8 GB |
+| aloha_static_pingpong | `lerobot/aloha_static_pingpong_test` | 6K | 14 | bimanual | 50 | ~0.1 GB |
+| aloha_static_tape | `lerobot/aloha_static_tape` | 35K | 14 | bimanual | 50 | ~0.5 GB |
+| aloha_static_pro_pencil | `lerobot/aloha_static_pro_pencil` | 8.75K | 14 | bimanual | 50 | ~0.1 GB |
+| aloha_static_candy | `lerobot/aloha_static_candy` | 35K | 14 | bimanual | 50 | ~0.5 GB |
+| aloha_static_fork | `lerobot/aloha_static_fork_pick_up` | 60K | 14 | bimanual | 50 | ~0.9 GB |
+| aloha_static_velcro | `lerobot/aloha_static_thread_velcro` | 34.3K | 14 | bimanual | 50 | ~0.5 GB |
+| aloha_static_battery | `lerobot/aloha_static_battery` | 29.4K | 14 | bimanual | 50 | ~0.4 GB |
+| aloha_static_screw | `lerobot/aloha_static_screw_driver` | 20K | 14 | bimanual | 50 | ~0.3 GB |
+| aloha_static_towel | `lerobot/aloha_static_towel` | 25K | 14 | bimanual | 50 | ~0.4 GB |
+| aloha_static_ziploc | `lerobot/aloha_static_ziploc_slide` | 16.8K | 14 | bimanual | 50 | ~0.3 GB |
+| **ALOHA Static subtotal** | | **~441K** | | | | **~6.6 GB** |
+
+#### ALOHA Mobile Variants (6 tasks)
+
+| Dataset | HF Repo | Frames | Act Dim | Embodiment | Ctrl Hz | HDF5 Est. |
+|---------|---------|--------|---------|------------|---------|-----------|
+| aloha_mobile_cabinet | `lerobot/aloha_mobile_cabinet` | 128K | 16 | bimanual_mobile | 50 | ~2 GB |
+| aloha_mobile_chair | `lerobot/aloha_mobile_chair` | 110K | 16 | bimanual_mobile | 50 | ~1.7 GB |
+| aloha_mobile_wash_pan | `lerobot/aloha_mobile_wash_pan` | 55K | 16 | bimanual_mobile | 50 | ~0.8 GB |
+| aloha_mobile_wipe_wine | `lerobot/aloha_mobile_wipe_wine` | 65K | 16 | bimanual_mobile | 50 | ~1 GB |
+| aloha_mobile_elevator | `lerobot/aloha_mobile_elevator` | 45K | 16 | bimanual_mobile | 50 | ~0.7 GB |
+| aloha_mobile_shrimp | `lerobot/aloha_mobile_shrimp` | 67.5K | 16 | bimanual_mobile | 50 | ~1 GB |
+| **ALOHA Mobile subtotal** | | **~470K** | | | | **~7.2 GB** |
+
+#### OXE Batch 2 (19 datasets)
+
+| Dataset | HF Repo | Frames | Act Dim | Embodiment | Ctrl Hz | HDF5 Est. |
+|---------|---------|--------|---------|------------|---------|-----------|
+| berkeley_rpt | `lerobot/berkeley_rpt` | 393K | 8 | gripper_joint | 30 | ~6 GB |
+| toto | `lerobot/toto` | 326K | 8 | delta_eef | 30 | ~5 GB |
+| stanford_robocook | `lerobot/stanford_robocook` | 113K | 7 | delta_eef | 5 | ~2 GB |
+| berkeley_mvp | `lerobot/berkeley_mvp` | 45.3K | 7 | delta_eef | 5 | ~0.7 GB |
+| kaist_nonprehensile | `lerobot/kaist_nonprehensile` | 32.4K | 4 | delta_eef | 10 | ~0.5 GB |
+| ucsd_pick_place | `lerobot/ucsd_pick_and_place_dataset` | 67.8K | 8 | delta_eef | 3 | ~1 GB |
+| ucsd_kitchen | `lerobot/ucsd_kitchen_dataset` | 3.97K | 8 | delta_eef | 2 | ~0.1 GB |
+| asu_table_top | `lerobot/asu_table_top` | 26.1K | 9 | gripper_joint | 12 | ~0.4 GB |
+| utokyo_pr2_fridge | `lerobot/utokyo_pr2_opening_fridge` | 11.5K | 8 | delta_eef | 10 | ~0.2 GB |
+| utokyo_pr2_tabletop | `lerobot/utokyo_pr2_tabletop_manipulation` | 32.7K | 8 | delta_eef | 10 | ~0.5 GB |
+| utokyo_xarm_bimanual | `lerobot/utokyo_xarm_bimanual` | 1.51K | 14 | bimanual | 10 | ~0.03 GB |
+| tokyo_u_lsmo | `lerobot/tokyo_u_lsmo` | 11.9K | 8 | delta_eef | 10 | ~0.2 GB |
+| dlr_sara_grid | `lerobot/dlr_sara_grid_clamp` | 7.62K | 8 | delta_eef | 10 | ~0.1 GB |
+| dlr_sara_pour | `lerobot/dlr_sara_pour` | 13K | 8 | delta_eef | 10 | ~0.2 GB |
+| dlr_edan | `lerobot/dlr_edan_shared_control` | 8.93K | 8 | delta_eef | 5 | ~0.1 GB |
+| nyu_rot | `lerobot/nyu_rot_dataset` | 440 | 8 | delta_eef | 3 | ~0.01 GB |
+| usc_cloth_sim | `lerobot/usc_cloth_sim` | 100K | 4 | delta_eef | 10 | ~1.5 GB |
+| cmu_franka_exploration | `lerobot/cmu_franka_exploration_dataset` | 1.99K | 8 | delta_eef | 10 | ~0.03 GB |
+| imperialcollege_sawyer | `lerobot/imperialcollege_sawyer_wrist_cam` | 7.15K | 7 | delta_eef | 10 | ~0.1 GB |
+| **OXE Batch 2 subtotal** | | **~1.2M** | | | | **~18.6 GB** |
+
+#### Behavior 1K (×50 tasks)
+
+| Dataset | HF Repo | Frames | Act Dim | Embodiment | Ctrl Hz | Action Format | HF Size | HDF5 Est. | Prep Time |
+|---------|---------|--------|---------|------------|---------|---------------|---------|-----------|-----------|
+| behavior1k_t0000 | `lerobot/behavior1k-task0000` | ~430K | 23 | bimanual_mobile | 30 | abs joints+base | ~5.7 GB | ~3 GB | 2 hrs |
+| behavior1k_t0001-t0049 | `lerobot/behavior1k-task{0001-0049}` | ~430K ea | 23 | bimanual_mobile | 30 | abs joints+base | ~5 GB ea | ~3 GB ea | ~2 hrs ea |
+| **Behavior1K subtotal** | 50 tasks | **~21.5M** | | | | | **~255 GB** | **~150 GB** | **~100 hrs** |
+
+#### Totals and Disk Planning
+
+| Metric | Value |
+|--------|-------|
+| **Total datasets** | 110 (11 original + 10 OXE batch1 + 50 Behavior1K + 14 ALOHA static + 6 ALOHA mobile + 19 OXE batch2) |
+| **Total frames** | ~54M (excl. droid: ~29M) |
+| **Embodiment types** | 7 (gripper_eef, gripper_joint, bimanual, dex_hand, delta_eef, bimanual_mobile, bimanual_dex) |
+| **Action dim range** | 3 (jaco_play) to 39 (dexora) |
+| **Control freq range** | 3 Hz (nyu_franka, nyu_door) to 50 Hz (aloha) |
+| **HF download total** | ~2.8 TB (with droid) / ~1.1 TB (without droid) |
+| **HDF5 output total** | ~620 GB (with droid) / ~320 GB (without droid) |
+
+**Disk strategy with `--cleanup`:** Peak usage = HDF5 output + one dataset's HF cache at a time. Without droid: ~290 GB HDF5 + ~76 GB peak cache = ~366 GB. With droid: ~590 GB HDF5 + ~1.7 TB peak = ~2.3 TB.
+
+**Upload pipeline:** Use `upload_datasets.sh` to prepare → clean → upload each dataset to `christian0420/drifting-vla-{name}` on HuggingFace. Training servers pull pre-converted HDF5 via `download_from_hf.sh` — no conversion needed, instant setup.
+
+**Recommended preparation order** (smallest → largest for early validation):
+1. Quick (~30 min): aloha, cmu_stretch, jaco_play, columbia_pusht, nyu_door, austin_buds
+2. Medium (~2-4 hrs): nyu_franka, kuka, berkeley_fanuc, austin_sirius, bridgev2, cmu_play_fusion
+3. Large (~6-12 hrs): bc_z, taco_play, stanford_hydra, utaustin_mutex, austin_sailor, dexora
+4. Very large (~1-3 days): rlbench, dexwild, droid, behavior1k ×50
 
 ---
 

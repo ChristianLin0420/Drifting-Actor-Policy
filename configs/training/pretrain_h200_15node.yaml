@@ -23,7 +23,7 @@ vlm_mode: 'lora'
 lora_r: 16
 vlm_lr_scale: 0.1
 
-# Data — 22 datasets across 7 embodiment types
+# Data — 110 datasets across 7 embodiment types (11 original + 50 Behavior1K + 10 OXE batch1 + 14 ALOHA static + 6 ALOHA mobile + 19 OXE batch2)
 datasets:
   # Original datasets
   - aloha
@@ -36,11 +36,57 @@ datasets:
   - rlbench
   - dexwild
   - dexora
+  # Behavior 1K (all 50 tasks — add as prepared)
   - behavior1k_t0000
   - behavior1k_t0001
   - behavior1k_t0002
   - behavior1k_t0003
   - behavior1k_t0004
+  - behavior1k_t0005
+  - behavior1k_t0006
+  - behavior1k_t0007
+  - behavior1k_t0008
+  - behavior1k_t0009
+  - behavior1k_t0010
+  - behavior1k_t0011
+  - behavior1k_t0012
+  - behavior1k_t0013
+  - behavior1k_t0014
+  - behavior1k_t0015
+  - behavior1k_t0016
+  - behavior1k_t0017
+  - behavior1k_t0018
+  - behavior1k_t0019
+  - behavior1k_t0020
+  - behavior1k_t0021
+  - behavior1k_t0022
+  - behavior1k_t0023
+  - behavior1k_t0024
+  - behavior1k_t0025
+  - behavior1k_t0026
+  - behavior1k_t0027
+  - behavior1k_t0028
+  - behavior1k_t0029
+  - behavior1k_t0030
+  - behavior1k_t0031
+  - behavior1k_t0032
+  - behavior1k_t0033
+  - behavior1k_t0034
+  - behavior1k_t0035
+  - behavior1k_t0036
+  - behavior1k_t0037
+  - behavior1k_t0038
+  - behavior1k_t0039
+  - behavior1k_t0040
+  - behavior1k_t0041
+  - behavior1k_t0042
+  - behavior1k_t0043
+  - behavior1k_t0044
+  - behavior1k_t0045
+  - behavior1k_t0046
+  - behavior1k_t0047
+  - behavior1k_t0048
+  - behavior1k_t0049
   # Open X-Embodiment additions (verified repos)
   - bridgev2
   - kuka
@@ -52,6 +98,48 @@ datasets:
   - austin_sirius
   - columbia_pusht
   - nyu_door
+  # ALOHA Static variants (14)
+  - aloha_static_cups_open
+  - aloha_static_vinh_cup
+  - aloha_static_vinh_cup_left
+  - aloha_static_coffee
+  - aloha_static_pingpong
+  - aloha_static_tape
+  - aloha_static_pro_pencil
+  - aloha_static_candy
+  - aloha_static_fork
+  - aloha_static_velcro
+  - aloha_static_battery
+  - aloha_static_screw
+  - aloha_static_towel
+  - aloha_static_ziploc
+  # ALOHA Mobile variants (6)
+  - aloha_mobile_cabinet
+  - aloha_mobile_chair
+  - aloha_mobile_wash_pan
+  - aloha_mobile_wipe_wine
+  - aloha_mobile_elevator
+  - aloha_mobile_shrimp
+  # OXE batch 2 (19)
+  - berkeley_rpt
+  - toto
+  - stanford_robocook
+  - berkeley_mvp
+  - kaist_nonprehensile
+  - ucsd_pick_place
+  - ucsd_kitchen
+  - asu_table_top
+  - utokyo_pr2_fridge
+  - utokyo_pr2_tabletop
+  - utokyo_xarm_bimanual
+  - tokyo_u_lsmo
+  - dlr_sara_grid
+  - dlr_sara_pour
+  - dlr_edan
+  - nyu_rot
+  - usc_cloth_sim
+  - cmu_franka_exploration
+  - imperialcollege_sawyer
 
 image_size: 448
 action_horizon: 64

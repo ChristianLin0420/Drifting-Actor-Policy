@@ -223,3 +223,9 @@ interactive.sh
 
 # Test script
 test.sh
+
+# Cache Workers
+cache_worker_*/
+
+# Logs
+logs/

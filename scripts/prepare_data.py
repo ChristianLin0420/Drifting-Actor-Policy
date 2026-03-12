@@ -178,6 +178,204 @@ DATASETS = {
         'type': 'lerobot',
         'description': 'NYU door opening (20K, 7-dim EEF vel+gripper)',
     },
+    # ── ALOHA Static variants (LeRobot format, 14-dim bimanual) ──
+    'aloha_static_cups_open': {
+        'hf_repo': 'lerobot/aloha_static_cups_open',
+        'type': 'lerobot',
+        'description': 'ALOHA static cups open (20K, 14-dim bimanual)',
+    },
+    'aloha_static_vinh_cup': {
+        'hf_repo': 'lerobot/aloha_static_vinh_cup',
+        'type': 'lerobot',
+        'description': 'ALOHA static vinh cup (45.5K, 14-dim bimanual)',
+    },
+    'aloha_static_vinh_cup_left': {
+        'hf_repo': 'lerobot/aloha_static_vinh_cup_left',
+        'type': 'lerobot',
+        'description': 'ALOHA static vinh cup left (50K, 14-dim bimanual)',
+    },
+    'aloha_static_coffee': {
+        'hf_repo': 'lerobot/aloha_static_coffee',
+        'type': 'lerobot',
+        'description': 'ALOHA static coffee (55K, 14-dim bimanual)',
+    },
+    'aloha_static_pingpong': {
+        'hf_repo': 'lerobot/aloha_static_pingpong_test',
+        'type': 'lerobot',
+        'description': 'ALOHA static pingpong (6K, 14-dim bimanual)',
+    },
+    'aloha_static_tape': {
+        'hf_repo': 'lerobot/aloha_static_tape',
+        'type': 'lerobot',
+        'description': 'ALOHA static tape (35K, 14-dim bimanual)',
+    },
+    'aloha_static_pro_pencil': {
+        'hf_repo': 'lerobot/aloha_static_pro_pencil',
+        'type': 'lerobot',
+        'description': 'ALOHA static pro pencil (8.75K, 14-dim bimanual)',
+    },
+    'aloha_static_candy': {
+        'hf_repo': 'lerobot/aloha_static_candy',
+        'type': 'lerobot',
+        'description': 'ALOHA static candy (35K, 14-dim bimanual)',
+    },
+    'aloha_static_fork': {
+        'hf_repo': 'lerobot/aloha_static_fork_pick_up',
+        'type': 'lerobot',
+        'description': 'ALOHA static fork pick up (60K, 14-dim bimanual)',
+    },
+    'aloha_static_velcro': {
+        'hf_repo': 'lerobot/aloha_static_thread_velcro',
+        'type': 'lerobot',
+        'description': 'ALOHA static thread velcro (34.3K, 14-dim bimanual)',
+    },
+    'aloha_static_battery': {
+        'hf_repo': 'lerobot/aloha_static_battery',
+        'type': 'lerobot',
+        'description': 'ALOHA static battery (29.4K, 14-dim bimanual)',
+    },
+    'aloha_static_screw': {
+        'hf_repo': 'lerobot/aloha_static_screw_driver',
+        'type': 'lerobot',
+        'description': 'ALOHA static screw driver (20K, 14-dim bimanual)',
+    },
+    'aloha_static_towel': {
+        'hf_repo': 'lerobot/aloha_static_towel',
+        'type': 'lerobot',
+        'description': 'ALOHA static towel (25K, 14-dim bimanual)',
+    },
+    'aloha_static_ziploc': {
+        'hf_repo': 'lerobot/aloha_static_ziploc_slide',
+        'type': 'lerobot',
+        'description': 'ALOHA static ziploc (16.8K, 14-dim bimanual)',
+    },
+    # ── ALOHA Mobile variants (LeRobot format, 16-dim bimanual+base) ──
+    'aloha_mobile_cabinet': {
+        'hf_repo': 'lerobot/aloha_mobile_cabinet',
+        'type': 'lerobot',
+        'description': 'ALOHA mobile cabinet (128K, 16-dim bimanual+base)',
+    },
+    'aloha_mobile_chair': {
+        'hf_repo': 'lerobot/aloha_mobile_chair',
+        'type': 'lerobot',
+        'description': 'ALOHA mobile chair (110K, 16-dim bimanual+base)',
+    },
+    'aloha_mobile_wash_pan': {
+        'hf_repo': 'lerobot/aloha_mobile_wash_pan',
+        'type': 'lerobot',
+        'description': 'ALOHA mobile wash pan (55K, 16-dim bimanual+base)',
+    },
+    'aloha_mobile_wipe_wine': {
+        'hf_repo': 'lerobot/aloha_mobile_wipe_wine',
+        'type': 'lerobot',
+        'description': 'ALOHA mobile wipe wine (65K, 16-dim bimanual+base)',
+    },
+    'aloha_mobile_elevator': {
+        'hf_repo': 'lerobot/aloha_mobile_elevator',
+        'type': 'lerobot',
+        'description': 'ALOHA mobile elevator (45K, 16-dim bimanual+base)',
+    },
+    'aloha_mobile_shrimp': {
+        'hf_repo': 'lerobot/aloha_mobile_shrimp',
+        'type': 'lerobot',
+        'description': 'ALOHA mobile shrimp (67.5K, 16-dim bimanual+base)',
+    },
+    # ── Additional OXE datasets (LeRobot format) ──
+    'berkeley_rpt': {
+        'hf_repo': 'lerobot/berkeley_rpt',
+        'type': 'lerobot',
+        'description': 'Berkeley RPT (393K, 8-dim joint delta)',
+    },
+    'toto': {
+        'hf_repo': 'lerobot/toto',
+        'type': 'lerobot',
+        'description': 'TOTO (326K, 8-dim delta EEF)',
+    },
+    'stanford_robocook': {
+        'hf_repo': 'lerobot/stanford_robocook',
+        'type': 'lerobot',
+        'description': 'Stanford RoboCook (113K, 7-dim EEF vel)',
+    },
+    'berkeley_mvp': {
+        'hf_repo': 'lerobot/berkeley_mvp',
+        'type': 'lerobot',
+        'description': 'Berkeley MVP (45.3K, 7-dim delta EEF)',
+    },
+    'kaist_nonprehensile': {
+        'hf_repo': 'lerobot/kaist_nonprehensile',
+        'type': 'lerobot',
+        'description': 'KAIST nonprehensile (32.4K, 4-dim EEF vel)',
+    },
+    'ucsd_pick_place': {
+        'hf_repo': 'lerobot/ucsd_pick_and_place_dataset',
+        'type': 'lerobot',
+        'description': 'UCSD pick and place (67.8K, 8-dim delta EEF)',
+    },
+    'ucsd_kitchen': {
+        'hf_repo': 'lerobot/ucsd_kitchen_dataset',
+        'type': 'lerobot',
+        'description': 'UCSD kitchen (3.97K, 8-dim delta EEF)',
+    },
+    'asu_table_top': {
+        'hf_repo': 'lerobot/asu_table_top',
+        'type': 'lerobot',
+        'description': 'ASU table top (26.1K, 9-dim joint vel)',
+    },
+    'utokyo_pr2_fridge': {
+        'hf_repo': 'lerobot/utokyo_pr2_opening_fridge',
+        'type': 'lerobot',
+        'description': 'UTokyo PR2 fridge (11.5K, 8-dim delta EEF)',
+    },
+    'utokyo_pr2_tabletop': {
+        'hf_repo': 'lerobot/utokyo_pr2_tabletop_manipulation',
+        'type': 'lerobot',
+        'description': 'UTokyo PR2 tabletop (32.7K, 8-dim delta EEF)',
+    },
+    'utokyo_xarm_bimanual': {
+        'hf_repo': 'lerobot/utokyo_xarm_bimanual',
+        'type': 'lerobot',
+        'description': 'UTokyo xArm bimanual (1.51K, 14-dim bimanual)',
+    },
+    'tokyo_u_lsmo': {
+        'hf_repo': 'lerobot/tokyo_u_lsmo',
+        'type': 'lerobot',
+        'description': 'Tokyo U LSMO (11.9K, 8-dim delta EEF)',
+    },
+    'dlr_sara_grid': {
+        'hf_repo': 'lerobot/dlr_sara_grid_clamp',
+        'type': 'lerobot',
+        'description': 'DLR SARA grid clamp (7.62K, 8-dim delta EEF)',
+    },
+    'dlr_sara_pour': {
+        'hf_repo': 'lerobot/dlr_sara_pour',
+        'type': 'lerobot',
+        'description': 'DLR SARA pour (13K, 8-dim delta EEF)',
+    },
+    'dlr_edan': {
+        'hf_repo': 'lerobot/dlr_edan_shared_control',
+        'type': 'lerobot',
+        'description': 'DLR EDAN shared control (8.93K, 8-dim delta EEF)',
+    },
+    'nyu_rot': {
+        'hf_repo': 'lerobot/nyu_rot_dataset',
+        'type': 'lerobot',
+        'description': 'NYU ROT (440, 8-dim delta EEF)',
+    },
+    'usc_cloth_sim': {
+        'hf_repo': 'lerobot/usc_cloth_sim',
+        'type': 'lerobot',
+        'description': 'USC cloth sim (100K, 4-dim delta EEF)',
+    },
+    'cmu_franka_exploration': {
+        'hf_repo': 'lerobot/cmu_franka_exploration_dataset',
+        'type': 'lerobot',
+        'description': 'CMU Franka exploration (1.99K, 8-dim delta EEF)',
+    },
+    'imperialcollege_sawyer': {
+        'hf_repo': 'lerobot/imperialcollege_sawyer_wrist_cam',
+        'type': 'lerobot',
+        'description': 'Imperial College Sawyer (7.15K, 7-dim EEF vel)',
+    },
 }
 
 # Add Behavior 1K tasks
@@ -210,6 +408,48 @@ DATASET_VIEW_NAMES = {
     'austin_sirius': ['image'],
     'columbia_pusht': ['image'],
     'nyu_door': ['image'],
+    # ALOHA Static variants (top camera)
+    'aloha_static_cups_open': ['top'],
+    'aloha_static_vinh_cup': ['top'],
+    'aloha_static_vinh_cup_left': ['top'],
+    'aloha_static_coffee': ['top'],
+    'aloha_static_pingpong': ['top'],
+    'aloha_static_tape': ['top'],
+    'aloha_static_pro_pencil': ['top'],
+    'aloha_static_candy': ['top'],
+    'aloha_static_fork': ['top'],
+    'aloha_static_velcro': ['top'],
+    'aloha_static_battery': ['top'],
+    'aloha_static_screw': ['top'],
+    'aloha_static_towel': ['top'],
+    'aloha_static_ziploc': ['top'],
+    # ALOHA Mobile variants
+    'aloha_mobile_cabinet': ['image'],
+    'aloha_mobile_chair': ['image'],
+    'aloha_mobile_wash_pan': ['image'],
+    'aloha_mobile_wipe_wine': ['image'],
+    'aloha_mobile_elevator': ['image'],
+    'aloha_mobile_shrimp': ['image'],
+    # Additional OXE datasets
+    'berkeley_rpt': ['image'],
+    'toto': ['image'],
+    'stanford_robocook': ['image'],
+    'berkeley_mvp': ['image'],
+    'kaist_nonprehensile': ['image'],
+    'ucsd_pick_place': ['image'],
+    'ucsd_kitchen': ['image'],
+    'asu_table_top': ['image'],
+    'utokyo_pr2_fridge': ['image'],
+    'utokyo_pr2_tabletop': ['image'],
+    'utokyo_xarm_bimanual': ['image'],
+    'tokyo_u_lsmo': ['image'],
+    'dlr_sara_grid': ['image'],
+    'dlr_sara_pour': ['image'],
+    'dlr_edan': ['image'],
+    'nyu_rot': ['image'],
+    'usc_cloth_sim': ['image'],
+    'cmu_franka_exploration': ['image'],
+    'imperialcollege_sawyer': ['image'],
 }
 for _i in range(50):
     DATASET_VIEW_NAMES[f'behavior1k_t{_i:04d}'] = ['head', 'left_wrist', 'right_wrist']

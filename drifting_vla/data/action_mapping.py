@@ -279,6 +279,71 @@ for _i in range(50):
         'eef_vel_x', 'eef_vel_y', 'eef_vel_z', 'eef_angular_vel_roll',
     ]
 
+# ── ALOHA static variants (same format as 'aloha', 14-dim bimanual) ──
+_ALOHA_STATIC_NAMES = [
+    'aloha_static_cups_open', 'aloha_static_vinh_cup', 'aloha_static_vinh_cup_left',
+    'aloha_static_coffee', 'aloha_static_pingpong', 'aloha_static_tape',
+    'aloha_static_pro_pencil', 'aloha_static_candy', 'aloha_static_fork',
+    'aloha_static_velcro', 'aloha_static_battery', 'aloha_static_screw',
+    'aloha_static_towel', 'aloha_static_ziploc',
+]
+for _name in _ALOHA_STATIC_NAMES:
+    DATASET_FIELD_FORMATS[_name] = DATASET_FIELD_FORMATS['aloha']
+
+# ── ALOHA mobile variants (16-dim: bimanual + base) ──
+_ALOHA_MOBILE_NAMES = [
+    'aloha_mobile_cabinet', 'aloha_mobile_chair', 'aloha_mobile_wash_pan',
+    'aloha_mobile_wipe_wine', 'aloha_mobile_elevator', 'aloha_mobile_shrimp',
+]
+_ALOHA_MOBILE_FORMAT = DATASET_FIELD_FORMATS['aloha'] + ['base_vel_y', 'base_angular_vel']
+for _name in _ALOHA_MOBILE_NAMES:
+    DATASET_FIELD_FORMATS[_name] = _ALOHA_MOBILE_FORMAT
+
+# ── OXE additions (batch 2) ──
+_DELTA_EEF_8D_FORMAT = [
+    'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+    'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+    'gripper_open',
+]
+_DELTA_EEF_8D_NAMES = [
+    'toto', 'ucsd_pick_place', 'ucsd_kitchen',
+    'utokyo_pr2_fridge', 'utokyo_pr2_tabletop', 'utokyo_xarm_pick',
+    'tokyo_u_lsmo', 'dlr_sara_grid', 'dlr_sara_pour',
+    'dlr_edan', 'nyu_rot', 'cmu_franka_exploration',
+]
+for _name in _DELTA_EEF_8D_NAMES:
+    DATASET_FIELD_FORMATS[_name] = _DELTA_EEF_8D_FORMAT
+
+DATASET_FIELD_FORMATS['berkeley_mvp'] = [
+    'eef_pos_x', 'eef_pos_y', 'eef_pos_z',
+    'eef_angle_0', 'eef_angle_1', 'eef_angle_2', 'eef_angle_3',
+]
+DATASET_FIELD_FORMATS['berkeley_rpt'] = [
+    'arm_joint_0_vel', 'arm_joint_1_vel', 'arm_joint_2_vel',
+    'arm_joint_3_vel', 'arm_joint_4_vel', 'arm_joint_5_vel',
+    'arm_joint_6_vel', 'gripper_open',
+]
+_VEL_EEF_7D_FORMAT = [
+    'eef_vel_x', 'eef_vel_y', 'eef_vel_z',
+    'eef_angular_vel_roll', 'eef_angular_vel_pitch', 'eef_angular_vel_yaw',
+    'gripper_open',
+]
+for _name in ['stanford_robocook', 'imperialcollege_sawyer']:
+    DATASET_FIELD_FORMATS[_name] = _VEL_EEF_7D_FORMAT
+
+DATASET_FIELD_FORMATS['kaist_nonprehensile'] = [
+    'eef_vel_x', 'eef_vel_y', 'eef_vel_z', 'gripper_open',
+]
+DATASET_FIELD_FORMATS['usc_cloth_sim'] = [
+    'eef_pos_x', 'eef_pos_y', 'eef_pos_z', 'gripper_open',
+]
+DATASET_FIELD_FORMATS['asu_table_top'] = [
+    'arm_joint_0_vel', 'arm_joint_1_vel', 'arm_joint_2_vel',
+    'arm_joint_3_vel', 'arm_joint_4_vel', 'arm_joint_5_vel',
+    'arm_joint_6_vel', 'gripper_joint_0_vel', 'gripper_joint_1_vel',
+]
+DATASET_FIELD_FORMATS['utokyo_xarm_bimanual'] = DATASET_FIELD_FORMATS['aloha']
+
 
 # =============================================================================
 # assemble_state_vec — RDT-1B style named-field mapping
@@ -381,6 +446,19 @@ DATASET_EMBODIMENT = {
     'austin_sirius': EMBODIMENT_GRIPPER_EEF,
     'columbia_pusht': EMBODIMENT_GRIPPER_DELTA_EEF,
     'nyu_door': EMBODIMENT_GRIPPER_DELTA_EEF,
+    # ── ALOHA variants ──
+    **{name: EMBODIMENT_BIMANUAL for name in _ALOHA_STATIC_NAMES},
+    **{name: EMBODIMENT_BIMANUAL_MOBILE for name in _ALOHA_MOBILE_NAMES},
+    'utokyo_xarm_bimanual': EMBODIMENT_BIMANUAL,
+    # ── OXE additions (batch 2) ──
+    **{name: EMBODIMENT_GRIPPER_DELTA_EEF for name in _DELTA_EEF_8D_NAMES},
+    'berkeley_mvp': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'berkeley_rpt': EMBODIMENT_GRIPPER_JOINT,
+    'stanford_robocook': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'imperialcollege_sawyer': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'kaist_nonprehensile': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'usc_cloth_sim': EMBODIMENT_GRIPPER_DELTA_EEF,
+    'asu_table_top': EMBODIMENT_GRIPPER_JOINT,
 }
 
 DATASET_HF_REPOS = {
@@ -407,6 +485,43 @@ DATASET_HF_REPOS = {
     'austin_sirius': 'lerobot/austin_sirius_dataset',
     'columbia_pusht': 'lerobot/columbia_cairlab_pusht_real',
     'nyu_door': 'lerobot/nyu_door_opening_surprising_effectiveness',
+    # ── ALOHA variants ──
+    'aloha_static_cups_open': 'lerobot/aloha_static_cups_open',
+    'aloha_static_vinh_cup': 'lerobot/aloha_static_vinh_cup',
+    'aloha_static_vinh_cup_left': 'lerobot/aloha_static_vinh_cup_left',
+    'aloha_static_coffee': 'lerobot/aloha_static_coffee',
+    'aloha_static_pingpong': 'lerobot/aloha_static_pingpong_test',
+    'aloha_static_tape': 'lerobot/aloha_static_tape',
+    'aloha_static_pro_pencil': 'lerobot/aloha_static_pro_pencil',
+    'aloha_static_candy': 'lerobot/aloha_static_candy',
+    'aloha_static_fork': 'lerobot/aloha_static_fork_pick_up',
+    'aloha_static_velcro': 'lerobot/aloha_static_thread_velcro',
+    'aloha_static_battery': 'lerobot/aloha_static_battery',
+    'aloha_static_screw': 'lerobot/aloha_static_screw_driver',
+    'aloha_static_towel': 'lerobot/aloha_static_towel',
+    'aloha_static_ziploc': 'lerobot/aloha_static_ziploc_slide',
+    **{name: f'lerobot/{name}' for name in _ALOHA_MOBILE_NAMES},
+    # ── OXE additions (batch 2) ──
+    'toto': 'lerobot/toto',
+    'ucsd_pick_place': 'lerobot/ucsd_pick_and_place_dataset',
+    'ucsd_kitchen': 'lerobot/ucsd_kitchen_dataset',
+    'utokyo_pr2_fridge': 'lerobot/utokyo_pr2_opening_fridge',
+    'utokyo_pr2_tabletop': 'lerobot/utokyo_pr2_tabletop_manipulation',
+    'utokyo_xarm_pick': 'lerobot/utokyo_xarm_pick_and_place',
+    'tokyo_u_lsmo': 'lerobot/tokyo_u_lsmo',
+    'dlr_sara_grid': 'lerobot/dlr_sara_grid_clamp',
+    'dlr_sara_pour': 'lerobot/dlr_sara_pour',
+    'dlr_edan': 'lerobot/dlr_edan_shared_control',
+    'nyu_rot': 'lerobot/nyu_rot_dataset',
+    'cmu_franka_exploration': 'lerobot/cmu_franka_exploration_dataset',
+    'berkeley_mvp': 'lerobot/berkeley_mvp',
+    'berkeley_rpt': 'lerobot/berkeley_rpt',
+    'stanford_robocook': 'lerobot/stanford_robocook',
+    'imperialcollege_sawyer': 'lerobot/imperialcollege_sawyer_wrist_cam',
+    'kaist_nonprehensile': 'lerobot/kaist_nonprehensile',
+    'usc_cloth_sim': 'lerobot/usc_cloth_sim',
+    'asu_table_top': 'lerobot/asu_table_top',
+    'utokyo_xarm_bimanual': 'lerobot/utokyo_xarm_bimanual',
 }
 
 LEROBOT_DATASETS = {
@@ -419,6 +534,14 @@ LEROBOT_DATASETS = {
     'kuka', 'berkeley_fanuc', 'cmu_play_fusion', 'jaco_play',
     'austin_buds', 'austin_sailor', 'austin_sirius',
     'columbia_pusht', 'nyu_door',
+    # ── ALOHA variants ──
+    *_ALOHA_STATIC_NAMES, *_ALOHA_MOBILE_NAMES,
+    'utokyo_xarm_bimanual',
+    # ── OXE additions (batch 2) ──
+    *_DELTA_EEF_8D_NAMES,
+    'berkeley_mvp', 'berkeley_rpt',
+    'stanford_robocook', 'imperialcollege_sawyer',
+    'kaist_nonprehensile', 'usc_cloth_sim', 'asu_table_top',
 }
 
 DATASET_NATIVE_ACTION_DIM = {
@@ -445,6 +568,19 @@ DATASET_NATIVE_ACTION_DIM = {
     'austin_sirius': 10,
     'columbia_pusht': 7,
     'nyu_door': 7,
+    # ── ALOHA variants ──
+    **{name: 14 for name in _ALOHA_STATIC_NAMES},
+    **{name: 16 for name in _ALOHA_MOBILE_NAMES},
+    'utokyo_xarm_bimanual': 14,
+    # ── OXE additions (batch 2) ──
+    **{name: 8 for name in _DELTA_EEF_8D_NAMES},
+    'berkeley_mvp': 7,
+    'berkeley_rpt': 8,
+    'stanford_robocook': 7,
+    'imperialcollege_sawyer': 7,
+    'kaist_nonprehensile': 4,
+    'usc_cloth_sim': 4,
+    'asu_table_top': 9,
 }
 
 DATASET_ACTION_FORMAT = {
@@ -471,6 +607,19 @@ DATASET_ACTION_FORMAT = {
     'austin_sirius': 'absolute_ee',
     'columbia_pusht': 'delta_ee',
     'nyu_door': 'ee_velocity',
+    # ── ALOHA variants ──
+    **{name: 'absolute_joints' for name in _ALOHA_STATIC_NAMES},
+    **{name: 'absolute_joints' for name in _ALOHA_MOBILE_NAMES},
+    'utokyo_xarm_bimanual': 'absolute_joints',
+    # ── OXE additions (batch 2) ──
+    **{name: 'delta_ee' for name in _DELTA_EEF_8D_NAMES},
+    'berkeley_mvp': 'delta_ee',
+    'berkeley_rpt': 'joint_velocity',
+    'stanford_robocook': 'ee_velocity',
+    'imperialcollege_sawyer': 'ee_velocity',
+    'kaist_nonprehensile': 'ee_velocity',
+    'usc_cloth_sim': 'delta_ee',
+    'asu_table_top': 'joint_velocity',
 }
 
 

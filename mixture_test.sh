@@ -16,9 +16,11 @@
 # =============================================================================
 set -e
 
-DATASETS="aloha bc_z taco_play stanford_hydra cmu_stretch utaustin_mutex \
-          nyu_franka dexora bridgev2 kuka berkeley_fanuc cmu_play_fusion \
-          jaco_play austin_buds austin_sirius columbia_pusht nyu_door"
+DATASETS="aloha"
+
+# DATASETS="aloha bc_z taco_play stanford_hydra cmu_stretch utaustin_mutex \
+#           nyu_franka dexora bridgev2 kuka berkeley_fanuc cmu_play_fusion \
+#           jaco_play austin_buds austin_sirius columbia_pusht nyu_door"
 
 # Need to check: dexwild, rlbench droid droid behavior1k_t0000-t0049 austin_sailor
 

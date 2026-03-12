@@ -1,0 +1,111 @@
+# =============================================================================
+# Two-Node H100 Pretraining Configuration
+# =============================================================================
+# 2 nodes × 8 H100 80GB GPUs = 16 GPUs
+# Global batch: 32/gpu × 2 accum × 16 GPUs = 1,024
+#
+# Launch (run on EACH node, or use SLURM):
+#   torchrun --nnodes=2 --nproc_per_node=8 \
+#     --rdzv_id=drifting_pretrain --rdzv_backend=c10d \
+#     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+#     scripts/train.py \
+#     --datasets aloha bc_z taco_play stanford_hydra cmu_stretch \
+#                utaustin_mutex nyu_franka dexora kuka berkeley_fanuc \
+#                cmu_play_fusion jaco_play austin_buds austin_sirius \
+#                columbia_pusht nyu_door \
+#     --episodes-root ./data/episodes \
+#     --batch-size 32 --grad-accumulation 2 \
+#     --max-steps 500000 --lr 1e-4 \
+#     --vlm-mode lora --lora-r 16 --vlm-lr-scale 0.1 \
+#     --loss-type hybrid --model-size base \
+#     --num-workers 8 \
+#     --image-aug --cond-mask-prob 0.1 \
+#     --log-every 100 --eval-every 2000 --save-every 5000 \
+#     --wandb-mode online --wandb-project drifting-vla-pretrain
+#
+# SLURM example (sbatch):
+#   #!/bin/bash
+#   #SBATCH --nodes=2
+#   #SBATCH --ntasks-per-node=1
+#   #SBATCH --gpus-per-node=8
+#   #SBATCH --job-name=drifting-vla
+#   export MASTER_ADDR=$(scontrol show hostname $SLURM_NODELIST | head -n 1)
+#   export MASTER_PORT=29500
+#   srun torchrun --nnodes=2 --nproc_per_node=8 \
+#     --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c10d \
+#     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+#     scripts/train.py [args...]
+#
+# Note: H100 80GB fits batch_size=32 with action_horizon=64 + Qwen3-VL LoRA.
+#       If OOM, reduce to batch_size=16 with grad_accumulation=4.
+
+# Model
+model_size: 'base'
+vlm: 'qwen3vl'
+vlm_mode: 'lora'
+lora_r: 16
+vlm_lr_scale: 0.1
+
+# Data
+datasets:
+  - aloha
+  - bc_z
+  - taco_play
+  - stanford_hydra
+  - cmu_stretch
+  - utaustin_mutex
+  - nyu_franka
+  - dexora
+  - bridgev2
+  - kuka
+  - berkeley_fanuc
+  - cmu_play_fusion
+  - jaco_play
+  - austin_buds
+  - austin_sirius
+  - columbia_pusht
+  - nyu_door
+
+image_size: 448
+action_horizon: 64
+
+# Optimization — matches RDT-1B baseline
+batch_size: 32
+grad_accumulation_steps: 2
+learning_rate: 1e-4
+weight_decay: 0.01
+warmup_steps: 10000
+max_steps: 500000
+grad_clip: 1.0
+
+# Drifting Loss
+loss_type: 'hybrid'
+drift_weight: 0.001
+temperatures: [0.02, 0.05, 0.2]
+n_pos_samples: 128
+n_neg_samples: 64
+neg_queue_size: 8192
+pos_queue_size: 4096
+normalize_features: true
+normalize_drift: true
+
+# EMA
+ema_decay: 0.9999
+
+# AMP
+use_amp: true
+amp_dtype: 'bfloat16'
+
+# DataLoader
+num_workers: 8
+image_aug: true
+cond_mask_prob: 0.1
+
+# Logging
+log_every: 100
+eval_every: 2000
+save_every: 5000
+
+# WandB
+wandb_mode: 'online'
+wandb_project: 'drifting-vla-pretrain'
