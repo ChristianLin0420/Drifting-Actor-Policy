@@ -515,6 +515,39 @@ def _detect_image_keys(column_names: list) -> list:
 # LeRobot datasets — stream from HF, write HDF5 directly (NO Arrow)
 # =============================================================================
 
+def _clear_lerobot_cache(hf_repo: str):
+    """Delete corrupted LeRobot/HF cache for a dataset so re-download succeeds."""
+    import shutil
+    repo_path = hf_repo.replace('/', os.sep)
+    cache_bases = []
+    hf_home = os.environ.get('HF_HOME', '')
+    if hf_home:
+        cache_bases.append(Path(hf_home) / 'lerobot')
+        cache_bases.append(Path(hf_home) / 'datasets')
+    cache_bases.append(Path.home() / '.cache' / 'lerobot')
+    cache_bases.append(Path.home() / '.cache' / 'huggingface' / 'lerobot')
+    for base in cache_bases:
+        target = base / repo_path
+        if target.exists():
+            logger.info(f"    Clearing cache: {target}")
+            shutil.rmtree(str(target), ignore_errors=True)
+
+
+def _group_episodes_fast(episode_col) -> dict:
+    """Group frame indices by episode_index using O(n log n) argsort+split.
+
+    ~100× faster than the naive O(n*m) np.where loop for large datasets
+    (e.g. behavior1k: 1.5M frames × 200 episodes).
+    """
+    ep_col_np = np.asarray(episode_col)
+    sort_idx = np.argsort(ep_col_np, kind='mergesort')
+    sorted_eps = ep_col_np[sort_idx]
+    change_points = np.where(np.diff(sorted_eps) != 0)[0] + 1
+    groups = np.split(sort_idx, change_points)
+    unique_ep_vals = sorted_eps[np.concatenate([[0], change_points])]
+    return {int(ep): g.tolist() for ep, g in zip(unique_ep_vals, groups)}
+
+
 def prepare_lerobot(
     ds_name: str,
     hf_repo: str,
@@ -537,14 +570,28 @@ def prepare_lerobot(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"  Loading via LeRobot API: {hf_repo}")
-    try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        lerobot_ds = LeRobotDataset(hf_repo, video_backend='pyav')
-    except Exception as e:
-        logger.error(f"  Failed to load {hf_repo} via LeRobot API: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    max_retries = 2
+    lerobot_ds = None
+    for attempt in range(max_retries + 1):
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+            lerobot_ds = LeRobotDataset(hf_repo, video_backend='pyav')
+            break
+        except Exception as e:
+            err_str = str(e) + (str(e.__cause__) if e.__cause__ else '')
+            is_corrupt = any(s in err_str for s in [
+                'ArrowInvalid', 'magic bytes', 'corrupted',
+                'DatasetGenerationError', 'not a parquet file',
+            ])
+            if is_corrupt and attempt < max_retries:
+                logger.warning(f"  Corrupted download (attempt {attempt+1}/{max_retries+1}), "
+                               f"clearing cache and retrying...")
+                _clear_lerobot_cache(hf_repo)
+                continue
+            logger.error(f"  Failed to load {hf_repo} via LeRobot API: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     hf = lerobot_ds.hf_dataset
     total_frames = len(hf)
@@ -597,11 +644,8 @@ def prepare_lerobot(
     mask_info = get_action_mask(embodiment_id, native_dim=native_dim)
     field_names = DATASET_FIELD_FORMATS.get(ds_name)
 
-    # Numpy-vectorized episode grouping (much faster than Python for-loop)
-    logger.info(f"  Grouping frames by episode (numpy)...")
-    ep_col_np = np.array(hf['episode_index'])
-    unique_eps = np.unique(ep_col_np)
-    episodes = {int(ep): np.where(ep_col_np == ep)[0].tolist() for ep in unique_eps}
+    logger.info(f"  Grouping frames by episode (argsort)...")
+    episodes = _group_episodes_fast(hf['episode_index'])
 
     ep_ids = sorted(episodes.keys())
     if max_episodes:
@@ -917,12 +961,9 @@ def _convert_hf_dataset_to_episodes(
     native_dim = DATASET_NATIVE_ACTION_DIM.get(ds_name, 7)
     mask_info = get_action_mask(embodiment_id, native_dim=native_dim)
 
-    # Numpy-vectorized episode grouping (avoid per-row deserialization)
-    logger.info(f"  Grouping episodes (numpy)...")
+    logger.info(f"  Grouping episodes (argsort)...")
     if 'episode_index' in all_cols:
-        ep_col_np = np.array(hf_ds['episode_index'])
-        unique_eps = np.unique(ep_col_np)
-        episodes = {int(ep): np.where(ep_col_np == ep)[0].tolist() for ep in unique_eps}
+        episodes = _group_episodes_fast(hf_ds['episode_index'])
     else:
         episodes = {0: list(range(len(hf_ds)))}
 

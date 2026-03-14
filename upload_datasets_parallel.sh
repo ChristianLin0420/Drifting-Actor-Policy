@@ -46,7 +46,8 @@ ALL_DATASETS=(
     # Original
     # taco_play stanford_hydra utaustin_mutex
     # Behavior 1K
-    $(for i in $(seq -w 0 49); do echo "behavior1k_t00$i"; done)
+    $(for i in $(seq -w 0 24); do echo "behavior1k_t00$i"; done)
+    # $(for i in $(seq -w 25 49); do echo "behavior1k_t00$i"; done)
     # OXE batch 1
     # bridgev2 kuka berkeley_fanuc cmu_play_fusion jaco_play
     # austin_buds austin_sailor austin_sirius columbia_pusht nyu_door
