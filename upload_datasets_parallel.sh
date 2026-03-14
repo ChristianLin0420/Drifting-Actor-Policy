@@ -44,12 +44,12 @@ done
 # All datasets
 ALL_DATASETS=(
     # Original
-    taco_play stanford_hydra utaustin_mutex
+    # taco_play stanford_hydra utaustin_mutex
     # Behavior 1K
-    # $(for i in $(seq -w 0 49); do echo "behavior1k_t00$i"; done)
+    $(for i in $(seq -w 0 49); do echo "behavior1k_t00$i"; done)
     # OXE batch 1
-    bridgev2 kuka berkeley_fanuc cmu_play_fusion jaco_play
-    austin_buds austin_sailor austin_sirius columbia_pusht nyu_door
+    # bridgev2 kuka berkeley_fanuc cmu_play_fusion jaco_play
+    # austin_buds austin_sailor austin_sirius columbia_pusht nyu_door
     # # ALOHA Static
     # aloha_static_cups_open aloha_static_vinh_cup aloha_static_vinh_cup_left
     # aloha_static_coffee aloha_static_pingpong aloha_static_tape

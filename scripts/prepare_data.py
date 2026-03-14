@@ -525,12 +525,15 @@ def prepare_lerobot(
 ):
     """Download + convert a LeRobot-format dataset in one pass.
 
-    FAST PATH: reads actions/metadata from parquet (instant), decodes video
-    per-episode in batch (50-100× faster than per-frame lerobot_ds[i]).
-    
-    For parquet-with-images datasets (e.g., aloha), images are read directly
-    from the dataset without video decoding.
+    Optimized pipeline:
+      - Threaded multi-view video decode (3 views in parallel via ThreadPoolExecutor)
+      - Batch parquet reads via hf.select() (avoid per-row deserialization)
+      - LZF compression for HDF5 images (3-5× faster write than gzip)
+      - Language read from parquet (avoid spurious video decode)
+      - Numpy-based episode grouping (vectorized)
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"  Loading via LeRobot API: {hf_repo}")
@@ -543,11 +546,10 @@ def prepare_lerobot(
         traceback.print_exc()
         return False
 
-    hf = lerobot_ds.hf_dataset  # parquet — fast access for actions/metadata
+    hf = lerobot_ds.hf_dataset
     total_frames = len(hf)
     logger.info(f"  Loaded {total_frames} frames")
 
-    # Detect image keys from a single decoded sample
     sample0 = lerobot_ds[0]
     all_keys = list(sample0.keys())
     _NON_RGB = ('depth', 'seg', 'segmentation', 'mask', 'normal', 'flow', 'pointcloud')
@@ -557,16 +559,13 @@ def prepare_lerobot(
                       if not any(s in k.lower() for s in _NON_RGB)]
     logger.info(f"  Image keys (rgb_only={rgb_only}): {image_keys}")
 
-    # Detect video paths for batch decoding
-    # LeRobot v2: videos at {root}/videos/{camera_key}/chunk-{chunk}/file-{file}.mp4
     dataset_root = getattr(lerobot_ds, 'root', None)
     videos_dir = None
-    chunks_size = 1000  # default
+    chunks_size = 1000
     if dataset_root is not None:
         vd = Path(dataset_root) / 'videos'
         if vd.exists():
             videos_dir = vd
-            # Read chunks_size from meta/info.json
             info_path = Path(dataset_root) / 'meta' / 'info.json'
             if info_path.exists():
                 import json as _json
@@ -577,32 +576,32 @@ def prepare_lerobot(
     else:
         logger.info(f"  No video dir — using per-frame decode (parquet images)")
 
-    # Detect language key (only in full dataset, not parquet)
+    # Detect language key — prefer parquet columns to avoid video decode
+    parquet_cols = hf.column_names
     language_key = None
+    language_in_parquet = False
     for k in ['task', 'language_instruction', 'language', 'text']:
+        if k in parquet_cols:
+            language_key = k
+            language_in_parquet = True
+            break
         if k in all_keys:
             language_key = k
             break
 
-    # Detect state/proprio key (in parquet)
-    parquet_cols = hf.column_names
     proprio_keys = [k for k in parquet_cols
                     if 'state' in k.lower() or 'proprio' in k.lower()]
 
-    # Action info
     embodiment_id = DATASET_EMBODIMENT.get(ds_name, 0)
     native_dim = DATASET_NATIVE_ACTION_DIM.get(ds_name, 7)
     mask_info = get_action_mask(embodiment_id, native_dim=native_dim)
     field_names = DATASET_FIELD_FORMATS.get(ds_name)
 
-    # Group frames by episode from parquet (fast, no video decode)
-    logger.info(f"  Grouping frames by episode...")
-    episodes = defaultdict(list)
-    # Batch read episode_index column (much faster than per-row)
-    ep_col = hf['episode_index']
-    for i in range(total_frames):
-        ep_idx = int(ep_col[i])
-        episodes[ep_idx].append(i)
+    # Numpy-vectorized episode grouping (much faster than Python for-loop)
+    logger.info(f"  Grouping frames by episode (numpy)...")
+    ep_col_np = np.array(hf['episode_index'])
+    unique_eps = np.unique(ep_col_np)
+    episodes = {int(ep): np.where(ep_col_np == ep)[0].tolist() for ep in unique_eps}
 
     ep_ids = sorted(episodes.keys())
     if max_episodes:
@@ -621,16 +620,22 @@ def prepare_lerobot(
         ep_path = output_dir / ep_filename
 
         with h5py.File(str(ep_path), 'w') as hf_out:
-            # ── Images: batch video decode (FAST) ──
+            # ── Images: THREADED multi-view decode (all views in parallel) ──
             n_views = len(image_keys)
             if n_views > 0:
-                for v_idx, img_key in enumerate(image_keys):
-                    frames = _load_episode_images(
+                def _decode_view(args):
+                    v_idx, img_key = args
+                    return v_idx, img_key, _load_episode_images(
                         lerobot_ds, videos_dir, img_key, ep_id, ep_len,
                         frame_indices, chunks_size,
                     )
+
+                with ThreadPoolExecutor(max_workers=min(n_views, 4)) as pool:
+                    results = list(pool.map(_decode_view,
+                                           [(v, k) for v, k in enumerate(image_keys)]))
+
+                for v_idx, img_key, frames in results:
                     if frames is not None and len(frames) > 0:
-                        # Force uint8 — some video decoders return object arrays
                         if frames.dtype != np.uint8:
                             try:
                                 frames = np.asarray(frames, dtype=np.uint8)
@@ -641,21 +646,29 @@ def prepare_lerobot(
                         hf_out.create_dataset(
                             f'images/view_{v_idx}', data=frames,
                             chunks=(1,) + frames.shape[1:],
-                            compression='gzip', compression_opts=1,
+                            compression='lzf',
                         )
                     else:
                         n_views = max(n_views - 1, 0)
 
-            # ── Actions from parquet (fast, no video) ──
+            # ── Actions: BATCH parquet read (avoid per-row deserialization) ──
             actions_native = np.zeros((ep_len, native_dim), dtype=np.float32)
-            for t, fi in enumerate(frame_indices):
-                try:
-                    act = hf[fi]['action']
+            try:
+                ep_rows = hf.select(frame_indices)
+                action_col = ep_rows['action']
+                for t, act in enumerate(action_col):
                     if act is not None:
                         a = np.asarray(act).flatten().astype(np.float32)
                         actions_native[t, :min(len(a), native_dim)] = a[:native_dim]
-                except (TypeError, ValueError):
-                    pass  # skip malformed rows, keep zeros
+            except Exception:
+                for t, fi in enumerate(frame_indices):
+                    try:
+                        act = hf[fi]['action']
+                        if act is not None:
+                            a = np.asarray(act).flatten().astype(np.float32)
+                            actions_native[t, :min(len(a), native_dim)] = a[:native_dim]
+                    except (TypeError, ValueError):
+                        pass
 
             if field_names:
                 actions_unified, _ = assemble_state_vec_batch(actions_native, field_names)
@@ -664,48 +677,53 @@ def prepare_lerobot(
             hf_out.create_dataset('actions', data=actions_unified)
             all_actions.append(actions_unified)
 
-            # ── Action mask ──
             hf_out.create_dataset('action_mask', data=mask_info.mask)
 
-            # ── Proprioception from parquet (fast) ──
+            # ── Proprioception: BATCH parquet read ──
             if proprio_keys:
                 proprio_data = np.zeros((ep_len, UNIFIED_ACTION_DIM), dtype=np.float32)
-                for t, fi in enumerate(frame_indices):
-                    row = hf[fi]
-                    for pk in proprio_keys:
-                        val = row.get(pk)
-                        if val is not None:
-                            try:
-                                val = np.atleast_1d(np.asarray(val).flatten().astype(np.float32))[:native_dim]
-                            except (TypeError, ValueError):
-                                continue
-                            if field_names:
-                                p_unified, _ = assemble_state_vec_batch(val.reshape(1, -1), field_names)
-                                proprio_data[t] = p_unified[0]
-                            else:
-                                proprio_data[t] = map_to_unified(val.reshape(1, -1), embodiment_id)[0]
-                            break
+                try:
+                    ep_rows_p = hf.select(frame_indices) if 'ep_rows' not in dir() else ep_rows
+                    for t in range(ep_len):
+                        row = ep_rows_p[t]
+                        for pk in proprio_keys:
+                            val = row.get(pk)
+                            if val is not None:
+                                try:
+                                    val = np.atleast_1d(np.asarray(val).flatten().astype(np.float32))[:native_dim]
+                                except (TypeError, ValueError):
+                                    continue
+                                if field_names:
+                                    p_unified, _ = assemble_state_vec_batch(val.reshape(1, -1), field_names)
+                                    proprio_data[t] = p_unified[0]
+                                else:
+                                    proprio_data[t] = map_to_unified(val.reshape(1, -1), embodiment_id)[0]
+                                break
+                except Exception:
+                    pass
                 hf_out.create_dataset('proprio', data=proprio_data)
 
-            # ── Language (1 video decode per episode for task text) ──
+            # ── Language: read from parquet if possible (avoid video decode) ──
             lang = ""
             if language_key:
                 try:
-                    full_row = lerobot_ds[frame_indices[0]]
-                    lang_val = full_row.get(language_key, "")
+                    if language_in_parquet:
+                        lang_val = hf[frame_indices[0]][language_key]
+                    else:
+                        full_row = lerobot_ds[frame_indices[0]]
+                        lang_val = full_row.get(language_key, "")
                     if lang_val:
                         lang = str(lang_val)
                 except Exception:
                     pass
             hf_out.create_dataset('language', data=lang)
 
-            # ── Attributes ──
             hf_out.attrs['dataset_name'] = ds_name
             hf_out.attrs['embodiment_id'] = embodiment_id
             hf_out.attrs['episode_length'] = ep_len
             hf_out.attrs['n_views'] = n_views
             hf_out.attrs['action_dim'] = native_dim
-            hf_out.attrs['image_size'] = 0  # original resolution; resize at training time
+            hf_out.attrs['image_size'] = 0
 
         ep_metadata_list.append({'filename': ep_filename, 'length': ep_len, 'n_grasps': 0})
 
@@ -899,10 +917,14 @@ def _convert_hf_dataset_to_episodes(
     native_dim = DATASET_NATIVE_ACTION_DIM.get(ds_name, 7)
     mask_info = get_action_mask(embodiment_id, native_dim=native_dim)
 
-    episodes = defaultdict(list)
-    for i in range(len(hf_ds)):
-        ep_idx = hf_ds[i].get('episode_index', 0)
-        episodes[ep_idx].append(i)
+    # Numpy-vectorized episode grouping (avoid per-row deserialization)
+    logger.info(f"  Grouping episodes (numpy)...")
+    if 'episode_index' in all_cols:
+        ep_col_np = np.array(hf_ds['episode_index'])
+        unique_eps = np.unique(ep_col_np)
+        episodes = {int(ep): np.where(ep_col_np == ep)[0].tolist() for ep in unique_eps}
+    else:
+        episodes = {0: list(range(len(hf_ds)))}
 
     ep_ids = sorted(episodes.keys())
     if max_episodes:
@@ -913,6 +935,7 @@ def _convert_hf_dataset_to_episodes(
     all_actions = []
     ep_metadata_list = []
     n_views = len(image_keys) if image_keys else 0
+    proprio_keys = [k for k in all_cols if 'state' in k.lower() or 'proprio' in k.lower() or k == 'observation.state']
 
     for ep_num, ep_id in enumerate(tqdm(ep_ids, desc=f"  {ds_name}")):
         frame_indices = sorted(episodes[ep_id])
@@ -921,39 +944,52 @@ def _convert_hf_dataset_to_episodes(
         ep_filename = f"ep_{ep_num:06d}.hdf5"
         ep_path = output_dir / ep_filename
 
+        # Batch-select episode rows once (much faster than per-row hf_ds[fi])
+        try:
+            ep_rows = hf_ds.select(frame_indices)
+        except Exception:
+            ep_rows = None
+
         with h5py.File(str(ep_path), 'w') as hf:
             if n_views > 0:
-                first_img = _extract_image(hf_ds[frame_indices[0]], image_keys[0], image_size)
+                row0 = ep_rows[0] if ep_rows else hf_ds[frame_indices[0]]
+                first_img = _extract_image(row0, image_keys[0], image_size)
                 H, W = (first_img.shape[:2]) if first_img is not None else (image_size, image_size)
                 for v_idx, img_key in enumerate(image_keys):
                     view_data = np.zeros((ep_len, H, W, 3), dtype=np.uint8)
-                    for t, fi in enumerate(frame_indices):
-                        img = _extract_image(hf_ds[fi], img_key, image_size)
+                    for t in range(ep_len):
+                        row = ep_rows[t] if ep_rows else hf_ds[frame_indices[t]]
+                        img = _extract_image(row, img_key, image_size)
                         if img is not None:
                             view_data[t] = img
                     hf.create_dataset(
                         f'images/view_{v_idx}', data=view_data,
-                        chunks=(1, H, W, 3), compression='gzip', compression_opts=1,
+                        chunks=(1, H, W, 3), compression='lzf',
                     )
 
             actions_native = np.zeros((ep_len, native_dim), dtype=np.float32)
-            for t, fi in enumerate(frame_indices):
-                act = hf_ds[fi].get('action')
-                if act is not None:
-                    act = np.array(act, dtype=np.float32)
-                    actions_native[t, :min(len(act), native_dim)] = act[:native_dim]
+            if ep_rows is not None:
+                action_col = ep_rows['action']
+                for t, act in enumerate(action_col):
+                    if act is not None:
+                        act = np.array(act, dtype=np.float32)
+                        actions_native[t, :min(len(act), native_dim)] = act[:native_dim]
+            else:
+                for t, fi in enumerate(frame_indices):
+                    act = hf_ds[fi].get('action')
+                    if act is not None:
+                        act = np.array(act, dtype=np.float32)
+                        actions_native[t, :min(len(act), native_dim)] = act[:native_dim]
 
             actions_unified = map_to_unified(actions_native, embodiment_id)
             hf.create_dataset('actions', data=actions_unified)
             all_actions.append(actions_unified)
             hf.create_dataset('action_mask', data=mask_info.mask)
 
-            # Proprioception
-            proprio_keys = [k for k in all_cols if 'state' in k.lower() or 'proprio' in k.lower() or k == 'observation.state']
             if proprio_keys:
                 proprio_data = np.zeros((ep_len, UNIFIED_ACTION_DIM), dtype=np.float32)
-                for t, fi in enumerate(frame_indices):
-                    row = hf_ds[fi]
+                for t in range(ep_len):
+                    row = ep_rows[t] if ep_rows else hf_ds[frame_indices[t]]
                     for pk in proprio_keys:
                         val = row.get(pk)
                         if val is not None:
@@ -965,7 +1001,8 @@ def _convert_hf_dataset_to_episodes(
 
             lang = ""
             if language_key:
-                lang_val = hf_ds[frame_indices[0]].get(language_key, "")
+                row0 = ep_rows[0] if ep_rows else hf_ds[frame_indices[0]]
+                lang_val = row0.get(language_key, "")
                 if lang_val:
                     lang = str(lang_val)
             hf.create_dataset('language', data=lang)
@@ -1006,13 +1043,14 @@ def prepare_rlbench(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Primary path: HF datasets API (works for parquet repos) ──
+    # ── Primary path: HF datasets API (lazy loading to avoid OOM) ──
     try:
         from datasets import load_dataset
 
-        logger.info(f"  Streaming {ds_info['hf_repo']} (split=train) ...")
-        hf_ds = load_dataset(ds_info['hf_repo'], split='train')
-        logger.info(f"  Loaded {len(hf_ds)} samples in memory")
+        logger.info(f"  Loading {ds_info['hf_repo']} (split=train, lazy) ...")
+        hf_ds = load_dataset(ds_info['hf_repo'], split='train',
+                             keep_in_memory=False)
+        logger.info(f"  Loaded {len(hf_ds)} samples (memory-mapped)")
 
         return _convert_hf_dataset_to_episodes(
             hf_ds, 'rlbench', output_dir, image_size, max_episodes,
