@@ -18,6 +18,7 @@ features to generate action sequences.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as ckpt_fn
 from dataclasses import dataclass
 from typing import Optional
 import math
@@ -419,6 +420,7 @@ class DiTTransformer(nn.Module):
     def __init__(self, config: DiTConfig):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
         
         # Transformer blocks
         self.blocks = nn.ModuleList([
@@ -475,7 +477,10 @@ class DiTTransformer(nn.Module):
             Output tokens [B, L, D].
         """
         for block in self.blocks:
-            x = block(x, c, attention_mask)
+            if self.gradient_checkpointing and self.training:
+                x = ckpt_fn(block, x, c, attention_mask, use_reentrant=False)
+            else:
+                x = block(x, c, attention_mask)
         
         return self.final_norm(x)
     

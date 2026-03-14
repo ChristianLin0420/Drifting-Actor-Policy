@@ -229,3 +229,6 @@ cache_worker_*/
 
 # Logs
 logs/
+
+# Scripts
+rlbench.sh

@@ -19,6 +19,7 @@ Usage:
 
 import os
 import sys
+import signal
 import argparse
 import logging
 import time
@@ -112,11 +113,17 @@ class TrainConfig:
     # Distributed
     use_fsdp: bool = False
     
+    # Gradient checkpointing (saves ~40% GPU memory at ~30% speed cost)
+    gradient_checkpointing: bool = False
+    
     # Logging
     log_every: int = 50
     eval_every: int = 500
     save_every: int = 2000
     checkpoint_dir: str = './checkpoints'
+    
+    # Resume
+    resume: Optional[str] = None  # Path to checkpoint or "latest"
     
     # WandB
     wandb_project: str = 'drifting-vla'
@@ -156,6 +163,22 @@ class DriftingVLATrainer:
         
         self.global_step = 0
         self.best_loss = float('inf')
+        self._signal_received = False
+        
+        # Resume from checkpoint (must come after all components are built)
+        if config.resume:
+            self._load_checkpoint(config.resume)
+        
+        # Enable gradient checkpointing on DiT if requested
+        if getattr(config, 'gradient_checkpointing', False):
+            unwrapped = self._unwrapped_model()
+            if hasattr(unwrapped, 'transformer'):
+                unwrapped.transformer.gradient_checkpointing = True
+                if self.is_main:
+                    logger.info("DiT gradient checkpointing enabled")
+        
+        # SLURM-aware signal handler for graceful preemption
+        self._setup_signal_handler()
     
     def _build_model(self):
         """Build DriftingVLA model."""
@@ -421,6 +444,21 @@ class DriftingVLATrainer:
             except Exception as e:
                 logger.warning(f"WandB init failed: {e}")
     
+    def _setup_signal_handler(self):
+        """Register SIGTERM/SIGUSR1 handlers for SLURM preemption.
+
+        SLURM sends SIGUSR1 (via --signal=B:USR1@120) before SIGTERM.
+        On signal, we set a flag so the training loop saves and exits cleanly.
+        """
+        def _handler(signum, frame):
+            sig_name = signal.Signals(signum).name
+            if self.is_main:
+                logger.info(f"Received {sig_name} — will save checkpoint and exit after current step")
+            self._signal_received = True
+
+        signal.signal(signal.SIGUSR1, _handler)
+        signal.signal(signal.SIGTERM, _handler)
+
     def _get_batch(self) -> dict:
         """Get next training batch (with cycling)."""
         try:
@@ -620,6 +658,8 @@ class DriftingVLATrainer:
         """Main training loop."""
         cfg = self.config
         
+        start_step = self.global_step
+        
         if self.is_main:
             logger.info(f"{'='*60}")
             logger.info(f"Drifting-VLA Training")
@@ -632,8 +672,9 @@ class DriftingVLATrainer:
             accum = cfg.grad_accumulation_steps
             global_batch = per_gpu * accum * n_gpus
             logger.info(f"  Batch: {per_gpu}/gpu × {accum} accum × {n_gpus} GPUs = {global_batch} global")
-            logger.info(f"  Steps: {cfg.max_steps}")
+            logger.info(f"  Steps: {cfg.max_steps} (starting from {start_step})")
             logger.info(f"  Device: {self.device} ({n_gpus} GPUs)")
+            logger.info(f"  Gradient checkpointing: {getattr(cfg, 'gradient_checkpointing', False)}")
             logger.info(f"{'='*60}")
         
         self.model.train()
@@ -649,8 +690,17 @@ class DriftingVLATrainer:
         self._last_lambda_V = None
         self._last_per_temp = None
         
-        for step in range(cfg.max_steps):
+        for step in range(start_step, cfg.max_steps):
             self.global_step = step
+            
+            # Graceful exit on SLURM preemption signal
+            if self._signal_received:
+                if self.is_main:
+                    logger.info(f"Signal received at step {step} — saving checkpoint and exiting")
+                    self._save_checkpoint(step)
+                if self.distributed:
+                    dist.barrier()
+                return
             
             batch = self._get_batch()
             metrics = self.training_step(batch)
@@ -1078,7 +1128,7 @@ class DriftingVLATrainer:
         return eval_metrics
     
     def _save_checkpoint(self, step: int, final: bool = False):
-        """Save model checkpoint."""
+        """Save model checkpoint + latest.pt for easy auto-resume."""
         ckpt_dir = Path(self.config.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         
@@ -1096,7 +1146,55 @@ class DriftingVLATrainer:
         name = 'final.pt' if final else f'step_{step}.pt'
         path = ckpt_dir / name
         torch.save(ckpt, path)
-        logger.info(f"Saved checkpoint: {path}")
+        
+        latest = ckpt_dir / 'latest.pt'
+        torch.save(ckpt, latest)
+        logger.info(f"Saved checkpoint: {path} (+ latest.pt)")
+
+    def _load_checkpoint(self, ckpt_path: str):
+        """Resume training from a saved checkpoint.
+
+        Restores model, optimizer, scheduler, EMA, and global_step.
+        Accepts a file path or "latest" to auto-find the newest checkpoint.
+        """
+        ckpt_dir = Path(self.config.checkpoint_dir)
+
+        if ckpt_path == 'latest':
+            latest = ckpt_dir / 'latest.pt'
+            if latest.exists():
+                ckpt_path = str(latest)
+            else:
+                ckpts = sorted(
+                    ckpt_dir.glob('step_*.pt'),
+                    key=lambda p: int(p.stem.split('_')[1]),
+                )
+                if not ckpts:
+                    if self.is_main:
+                        logger.warning("No checkpoint found — starting fresh")
+                    return
+                ckpt_path = str(ckpts[-1])
+
+        if not Path(ckpt_path).exists():
+            if self.is_main:
+                logger.warning(f"Checkpoint {ckpt_path} not found — starting fresh")
+            return
+
+        if self.is_main:
+            logger.info(f"Resuming from {ckpt_path}")
+
+        map_location = {'cuda:0': f'cuda:{self.local_rank}'} if self.distributed else self.device
+        ckpt = torch.load(ckpt_path, map_location=map_location, weights_only=False)
+
+        unwrapped = self._unwrapped_model()
+        unwrapped.load_state_dict(ckpt['model_state_dict'])
+        self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        if 'ema_state_dict' in ckpt:
+            self.ema.load_state_dict(ckpt['ema_state_dict'])
+        self.global_step = ckpt['step']
+
+        if self.is_main:
+            logger.info(f"Resumed at step {self.global_step}")
 
 
 def parse_args():
@@ -1159,6 +1257,14 @@ def parse_args():
                         choices=['queue', 'batch'],
                         help='Negative samples: replay queue (default) or same batch')
 
+    # Checkpointing & resume
+    parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints',
+                        help='Directory for saving checkpoints')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from checkpoint path, or "latest" to auto-find')
+    parser.add_argument('--gradient-checkpointing', action='store_true', default=False,
+                        help='Enable gradient checkpointing on DiT (saves ~40%% VRAM)')
+
     return parser.parse_args()
 
 
@@ -1207,6 +1313,9 @@ def main():
     config.normalize_features = args.normalize_features
     config.normalize_drift = args.normalize_drift
     config.neg_source = args.neg_source
+    config.checkpoint_dir = args.checkpoint_dir
+    config.resume = args.resume
+    config.gradient_checkpointing = args.gradient_checkpointing
 
     # Model size configs
     size_cfgs = {
