@@ -729,13 +729,8 @@ class DriftingVLATrainer:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), cfg.grad_clip
             )
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.scheduler.step()
-            self.ema.update()
-            metrics['grad_norm'] = grad_norm.item()
 
-            # Track per-group gradient norms (sampled at log_every to avoid GPU-CPU sync overhead)
+            # Track per-group gradient norms BEFORE zero_grad (sampled at log_every)
             if self.is_main and (self.global_step + 1) % cfg.log_every == 0:
                 for pg in self.optimizer.param_groups:
                     gname = pg.get('name', 'unknown')
@@ -745,6 +740,12 @@ class DriftingVLATrainer:
                         self.viz_logger._grad_history[gname] = []
                     self.viz_logger._grad_history[gname].append(
                         (self.global_step + 1, gnorm))
+
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.scheduler.step()
+            self.ema.update()
+            metrics['grad_norm'] = grad_norm.item()
         
         metrics['loss'] = loss.item()
         metrics['lr'] = self.optimizer.param_groups[0]['lr']
