@@ -591,6 +591,25 @@ def prepare_lerobot(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Large LeRobot repos need a resume-capable pre-download so that
+    # LeRobotDataset() finds a complete local cache instead of streaming 300GB+.
+    LARGE_LEROBOT_REPOS = {'lerobot/droid_1.0.1'}
+    if hf_repo in LARGE_LEROBOT_REPOS:
+        from huggingface_hub import snapshot_download as _snap_dl
+        hf_home = os.environ.get('HF_HOME', str(Path.home() / '.cache' / 'huggingface'))
+        local_dir = Path(hf_home) / 'lerobot' / hf_repo.replace('/', os.sep)
+        if not (local_dir / 'meta' / 'info.json').exists():
+            logger.info(f"  Pre-downloading {hf_repo} via snapshot (resume-capable)...")
+            try:
+                _snap_dl(
+                    repo_id=hf_repo, repo_type='dataset',
+                    local_dir=str(local_dir),
+                    resume_download=True,
+                    token=True,
+                )
+            except Exception as e:
+                logger.warning(f"  Pre-download incomplete ({e}), will retry via LeRobotDataset")
+
     logger.info(f"  Loading via LeRobot API: {hf_repo}")
     max_retries = 2
     lerobot_ds = None
@@ -601,12 +620,14 @@ def prepare_lerobot(
             break
         except Exception as e:
             err_str = str(e) + (str(e.__cause__) if e.__cause__ else '')
-            is_corrupt = any(s in err_str for s in [
+            is_retryable = any(s in err_str for s in [
                 'ArrowInvalid', 'magic bytes', 'corrupted',
                 'DatasetGenerationError', 'not a parquet file',
+                'receiver dropped', 'File Reconstruction Error',
+                'contain all requested episodes', 'Failed to send data',
             ])
-            if is_corrupt and attempt < max_retries:
-                logger.warning(f"  Corrupted download (attempt {attempt+1}/{max_retries+1}), "
+            if is_retryable and attempt < max_retries:
+                logger.warning(f"  Download/load failed (attempt {attempt+1}/{max_retries+1}), "
                                f"clearing cache and retrying...")
                 _clear_lerobot_cache(hf_repo)
                 continue
@@ -1215,7 +1236,9 @@ def prepare_rlbench(
 
         logger.info(f"  Loading {ds_info['hf_repo']} (split=train, lazy) ...")
         hf_ds = load_dataset(ds_info['hf_repo'], split='train',
-                             keep_in_memory=False)
+                             keep_in_memory=False,
+                             trust_remote_code=True,
+                             token=True)
         logger.info(f"  Loaded {len(hf_ds)} samples (memory-mapped)")
 
         return _convert_hf_dataset_to_episodes(
@@ -1236,10 +1259,20 @@ def prepare_rlbench(
                 repo_id=ds_info['hf_repo'], repo_type='dataset',
                 local_dir=str(rlbench_dir),
                 ignore_patterns=['*.avi', '*.mp4'],
+                token=True,
             )
         except Exception as e2:
             logger.error(f"  Download failed: {e2}")
             return False
+
+        # hqfang/rlbench-18-tasks stores per-task zip files — extract them
+        import zipfile
+        for zf in sorted(rlbench_dir.rglob('*.zip')):
+            extract_to = zf.parent / zf.stem
+            if not extract_to.exists() or not any(extract_to.rglob('*.pkl')):
+                logger.info(f"    Extracting {zf.name} ...")
+                with zipfile.ZipFile(str(zf), 'r') as z:
+                    z.extractall(str(zf.parent))
 
     ep_dirs = sorted(rlbench_dir.rglob('episode*'))
     ep_dirs = [d for d in ep_dirs if d.is_dir() and (d / 'low_dim_obs.pkl').exists()]
@@ -1367,10 +1400,14 @@ def prepare_dexwild(
             snapshot_download(
                 repo_id=ds_info['hf_repo'], repo_type='dataset',
                 local_dir=str(dex_dir),
+                token=True,
+                resume_download=True,
             )
             src_hdf5_files = sorted(dex_dir.glob('**/*.hdf5'))
         except Exception as e:
             logger.error(f"  Download failed: {e}")
+            logger.error(f"  If 403 Forbidden: visit https://huggingface.co/datasets/{ds_info['hf_repo']} "
+                         f"and request access, then re-run.")
             return False
 
     if not src_hdf5_files:
@@ -1723,7 +1760,10 @@ def prepare_hf_generic(
 
     logger.info(f"  Loading HF generic dataset: {hf_repo}")
     try:
-        hf_ds = load_dataset(hf_repo, split='train')
+        hf_ds = load_dataset(hf_repo, split='train',
+                             trust_remote_code=True,
+                             keep_in_memory=False,
+                             token=True)
         total = len(hf_ds)
         logger.info(f"  Loaded {total} episodes (video-per-row format)")
     except Exception as e:
