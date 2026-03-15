@@ -95,8 +95,8 @@ class EpisodeHDF5Dataset(Dataset):
         self.embodiment_id = self.metadata.get('embodiment_id', 0)
         self.view_names = self.metadata.get('view_names', ['view_0'])
 
-        # Build sample index
-        self.sample_index = self._build_sample_index()
+        # Build sample index (filters missing HDF5 files)
+        self.sample_index, self.n_valid_episodes = self._build_sample_index()
 
         if max_samples and len(self.sample_index) > max_samples:
             self.sample_index = self.sample_index[:max_samples]
@@ -105,24 +105,45 @@ class EpisodeHDF5Dataset(Dataset):
         self._file_cache: Dict[str, h5py.File] = {}
         self._cache_max = 100
 
+        # Per-dataset error tracking
+        self._error_count = 0
+        self._error_log_interval = 50
+
         logger.info(
             f"EpisodeHDF5Dataset({self.dataset_name}): "
             f"{len(self.sample_index)} samples from "
-            f"{len(self.metadata.get('episodes', []))} episodes"
+            f"{self.n_valid_episodes} episodes"
         )
 
-    def _build_sample_index(self) -> List[Tuple[str, int]]:
-        """Build index: each entry = (episode_file_path, start_timestep)."""
+    def _build_sample_index(self) -> Tuple[List[Tuple[str, int]], int]:
+        """Build index: each entry = (episode_file_path, start_timestep).
+
+        Only includes episodes whose HDF5 files actually exist on disk.
+        Returns (index, n_valid_episodes) for correct statistics.
+        """
         index = []
+        skipped = 0
+        valid = 0
 
         for ep_info in self.metadata.get('episodes', []):
-            ep_file = str(self.episode_dir / ep_info['filename'])
+            ep_path = self.episode_dir / ep_info['filename']
+            if not ep_path.exists():
+                skipped += 1
+                continue
+            valid += 1
+            ep_file = str(ep_path)
             ep_len = ep_info['length']
             max_start = max(1, ep_len - self.action_horizon + 1)
             for t in range(0, max_start, self.stride):
                 index.append((ep_file, t))
 
-        return index
+        if skipped > 0:
+            logger.warning(
+                f"{self.episode_dir.name}: skipped {skipped} missing episode files "
+                f"({len(index)} samples from {valid} episodes)"
+            )
+
+        return index, valid
 
     def _get_file(self, path: str) -> h5py.File:
         """Get HDF5 file handle with LRU caching."""
@@ -141,32 +162,37 @@ class EpisodeHDF5Dataset(Dataset):
         return len(self.sample_index)
 
     def __getitem__(self, idx: int) -> dict:
-        """Load a sample from HDF5 + preprocess for VLM ViT encoder.
-        
-        On failure, retries with random replacement samples (up to 5 attempts).
-        This ensures every sample in a batch has valid VLM keys — no dummies.
-        Same retry pattern used by RDT-1B, Octo, and OpenVLA.
+        """Load a sample from HDF5.
+
+        Returns raw image tensors + language string. VLM preprocessing
+        (image_processor + tokenizer) is done on GPU in the training loop,
+        NOT here in DataLoader workers — this eliminates the CPU bottleneck.
         """
         import random as _random
         for _attempt in range(5):
             try:
                 ep_file, t_start = self.sample_index[idx]
                 f = self._get_file(ep_file)
-
-                sample = self._load_temporal(f, t_start, idx)
-
-                return self._preprocess_vlm(sample)
+                return self._load_temporal(f, t_start, idx)
             except Exception as e:
                 if _attempt == 0:
-                    logger.warning(f"Error loading sample {idx}: {e}")
+                    self._error_count += 1
+                    ep_name = self.sample_index[idx][0].split('/')[-2] if idx < len(self.sample_index) else '?'
+                    logger.warning(
+                        f"[{self.dataset_name}] sample {idx} ep={ep_name}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    if self._error_count == 1:
+                        import traceback as _tb
+                        logger.error(f"[{self.dataset_name}] first error traceback:\n{_tb.format_exc()}")
+                    if self._error_count % self._error_log_interval == 0:
+                        logger.error(
+                            f"[{self.dataset_name}] cumulative errors: {self._error_count} "
+                            f"/ {len(self.sample_index)} samples"
+                        )
                 idx = _random.randint(0, len(self.sample_index) - 1)
 
-        # All retries failed — last resort: return first sample in dataset
-        logger.error(f"All 5 retry attempts failed, falling back to sample 0")
-        ep_file, t_start = self.sample_index[0]
-        f = self._get_file(ep_file)
-        sample = self._load_temporal(f, t_start, 0)
-        return self._preprocess_vlm(sample)
+        return self._empty_sample()
 
     def _load_temporal(self, f: h5py.File, t_start: int, idx: int) -> dict:
         """Load temporal episode sample."""
@@ -259,8 +285,11 @@ class EpisodeHDF5Dataset(Dataset):
                 for v in range(n_views):
                     key = f'images/view_{v}'
                     if key in f:
-                        img = f[key][fi]  # [H, W, 3] uint8
-                        img = self._preprocess_image(img)
+                        try:
+                            img = f[key][fi]  # [H, W, 3] uint8
+                            img = self._preprocess_image(img)
+                        except Exception:
+                            img = np.zeros((3, self.image_size, self.image_size), dtype=np.float32)
                         images.append(img)
                     else:
                         images.append(np.zeros((3, self.image_size, self.image_size), dtype=np.float32))
@@ -279,6 +308,14 @@ class EpisodeHDF5Dataset(Dataset):
         Images are stored at original resolution in HDF5;
         all resizing happens here at training time.
         """
+        if img.ndim < 2 or img.shape[0] == 0 or img.shape[1] == 0:
+            return np.zeros((3, self.image_size, self.image_size), dtype=np.float32)
+
+        if img.ndim == 2:
+            img = np.stack([img, img, img], axis=-1)
+        elif img.ndim >= 3 and img.shape[-1] != 3:
+            img = img[..., :3] if img.shape[-1] > 3 else np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
+
         H, W = img.shape[:2]
 
         # Step 1: Pad to square (RDT-1B uses processor-mean color; we use black)
@@ -325,11 +362,9 @@ class EpisodeHDF5Dataset(Dataset):
     def _preprocess_vlm(self, sample: dict) -> dict:
         """Preprocess for VLM ViT encoder in DataLoader worker.
 
-        Vision-encoder-only: just run processor on images to get pixel_values
-        and image_grid_thw. Tokenize text with the tokenizer. No chat template,
-        no conversation building, no PIL conversion loops in model forward.
-
-        This runs in parallel across DataLoader workers.
+        Uses processor.image_processor directly for images (bypasses the
+        multimodal processor.__call__ which requires text-image alignment
+        tokens and fails on many samples). Tokenizes text separately.
         """
         if self.vlm_processor is None:
             return sample
@@ -339,45 +374,72 @@ class EpisodeHDF5Dataset(Dataset):
         images_tensor = sample['images']  # [N, 3, H, W] float [0,1]
         language = sample.get('language', '') or 'describe the scene'
 
-        # Convert tensor images → PIL for processor
-        pil_images = []
-        for i in range(images_tensor.shape[0]):
-            img = images_tensor[i]
-            if img.abs().sum() < 1.0:
-                continue  # skip padded zero-images
-            img_np = (img.cpu().float() * 255).byte().permute(1, 2, 0).numpy()
-            pil_images.append(Image.fromarray(img_np))
+        pil_images = self._tensors_to_pil(images_tensor)
 
-        if not pil_images:
+        try:
+            img_inputs = self.vlm_processor.image_processor(
+                images=pil_images,
+                do_resize=False,
+                return_tensors='pt',
+            )
+        except Exception:
             pil_images = [Image.new('RGB', (self.image_size, self.image_size))]
+            img_inputs = self.vlm_processor.image_processor(
+                images=pil_images,
+                return_tensors='pt',
+            )
 
-        # Process images for ViT encoder (pixel_values + image_grid_thw)
-        # Use a dummy text to trigger image processing, then separately tokenize
-        img_inputs = self.vlm_processor(
-            text=[''],  # dummy text, we only want pixel_values
-            images=pil_images,
-            return_tensors='pt',
-        )
+        try:
+            text_inputs = self.vlm_processor.tokenizer(
+                language, return_tensors='pt',
+                padding=False, truncation=True, max_length=128,
+            )
+        except Exception:
+            text_inputs = self.vlm_processor.tokenizer(
+                'describe the scene', return_tensors='pt',
+                padding=False, truncation=True, max_length=128,
+            )
 
-        # Tokenize text separately (no images, no chat template)
-        text_inputs = self.vlm_processor.tokenizer(
-            language,
-            return_tensors='pt',
-            padding=False,
-            truncation=True,
-            max_length=128,
-        )
-
-        # Store preprocessed VLM inputs (squeeze batch dim — re-batched by collate)
         if 'pixel_values' in img_inputs:
-            sample['vlm_pixel_values'] = img_inputs['pixel_values'].squeeze(0)
+            pv = img_inputs['pixel_values']
+            if pv.dim() == 3 and pv.shape[0] == 1:
+                pv = pv.squeeze(0)
+            sample['vlm_pixel_values'] = pv
         if 'image_grid_thw' in img_inputs:
-            sample['vlm_image_grid_thw'] = img_inputs['image_grid_thw'].squeeze(0)
+            thw = img_inputs['image_grid_thw']
+            if thw.dim() == 3 and thw.shape[0] == 1:
+                thw = thw.squeeze(0)
+            sample['vlm_image_grid_thw'] = thw
 
         sample['vlm_input_ids'] = text_inputs['input_ids'].squeeze(0)
         sample['vlm_attention_mask'] = text_inputs['attention_mask'].squeeze(0)
 
         return sample
+
+    def _tensors_to_pil(self, images_tensor: torch.Tensor) -> list:
+        """Convert [N, 3, H, W] float tensor to list of validated PIL images."""
+        from PIL import Image
+
+        pil_images = []
+        for i in range(images_tensor.shape[0]):
+            img = images_tensor[i]
+            if img.abs().sum() < 1.0:
+                continue
+            try:
+                if img.dim() != 3 or img.shape[0] != 3:
+                    continue
+                img_np = (img.clamp(0, 1).cpu().float() * 255).byte().permute(1, 2, 0).numpy()
+                pil = Image.fromarray(img_np, 'RGB')
+                if pil.size[0] < 2 or pil.size[1] < 2:
+                    continue
+                pil_images.append(pil)
+            except Exception:
+                continue
+
+        if not pil_images:
+            pil_images = [Image.new('RGB', (self.image_size, self.image_size))]
+
+        return pil_images
 
     def _empty_sample(self) -> dict:
         """Return a valid empty sample for error recovery."""

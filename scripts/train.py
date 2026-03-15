@@ -27,6 +27,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 import json
+import yaml
 
 import torch
 import torch.nn as nn
@@ -113,8 +114,19 @@ class TrainConfig:
     # Distributed
     use_fsdp: bool = False
     
+    # VLM fine-tuning
+    vlm_mode: str = 'frozen'          # 'frozen', 'lora', 'full'
+    lora_r: int = 16
+    vlm_lr_scale: float = 0.1
+    
+    # DataLoader
+    num_workers: int = 8
+    image_aug: bool = False
+    cond_mask_prob: float = 0.1
+    
     # Gradient checkpointing (saves ~40% GPU memory at ~30% speed cost)
     gradient_checkpointing: bool = False
+    vit_gradient_checkpointing: bool = True  # ViT grad ckpt (disable for ~30% ViT speedup)
     
     # Logging
     log_every: int = 50
@@ -200,6 +212,7 @@ class DriftingVLATrainer:
             use_flash_attn=cfg.use_flash_attn,
             vlm_freeze=vlm_freeze,
             vlm_use_lora=vlm_use_lora,
+            vit_gradient_checkpointing=getattr(cfg, 'vit_gradient_checkpointing', True),
         )
         
         if self.is_main:
@@ -212,9 +225,14 @@ class DriftingVLATrainer:
         if vlm_use_lora or vlm_mode != 'frozen':
             self.model.vlm_backbone.load_vlm(self.device)
         
+        # Compile DiT transformer for kernel fusion (static shapes: [B,64,768])
+        # Use mode='default' for DDP + gradient checkpointing compatibility
+        self.model.transformer = torch.compile(self.model.transformer)
+        
         if self.distributed and not cfg.use_fsdp:
             self.model = DDP(self.model, device_ids=[self.local_rank],
-                             find_unused_parameters=True)
+                             find_unused_parameters=True,
+                             static_graph=True)
         
         # EMA (must be after VLM+LoRA loading so param shapes match)
         unwrapped = self.model.module if isinstance(self.model, DDP) else self.model
@@ -230,13 +248,21 @@ class DriftingVLATrainer:
         
         This is REQUIRED for training — without it, batches will have no
         VLM inputs and training will crash. Raises on failure.
+        Rank 0 downloads first; other ranks wait to avoid HF rate limits.
         """
         cfg = self.config
         from drifting_vla.models.vlm_backbone import VLM_SPECS
         hf_name = VLM_SPECS[cfg.vlm_model_key]['hf_name']
         from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(hf_name)
-        if self.is_main:
+        if self.distributed:
+            if self.is_main:
+                processor = AutoProcessor.from_pretrained(hf_name)
+                logger.info(f"Loaded VLM processor: {hf_name}")
+            dist.barrier()
+            if not self.is_main:
+                processor = AutoProcessor.from_pretrained(hf_name)
+        else:
+            processor = AutoProcessor.from_pretrained(hf_name)
             logger.info(f"Loaded VLM processor: {hf_name}")
         return processor
     
@@ -252,8 +278,9 @@ class DriftingVLATrainer:
         
         datasets = {}
         
-        # Load VLM processor once for all datasets (tokenization in DataLoader)
-        vlm_processor = self._load_vlm_processor()
+        # Load VLM processor — stored on Trainer for GPU-side preprocessing
+        # in training_step (NOT passed to DataLoader workers anymore).
+        self.vlm_processor = self._load_vlm_processor()
         
         for ds_name in cfg.datasets:
             ep_dir = episodes_root / ds_name
@@ -269,7 +296,7 @@ class DriftingVLATrainer:
                     action_horizon=cfg.action_horizon,
                     num_history_frames=3,
                     image_size=cfg.image_size,
-                    vlm_processor=vlm_processor,
+                    vlm_processor=None,
                     image_aug=getattr(cfg, 'image_aug', False),
                     cond_mask_prob=getattr(cfg, 'cond_mask_prob', 0.1),
                 )
@@ -308,15 +335,19 @@ class DriftingVLATrainer:
         # DataLoader
         sampler = create_weighted_sampler(self.unified_dataset, cfg.dataset_weights)
         
-        self.dataloader = DataLoader(
-            self.unified_dataset,
+        n_workers = min(getattr(cfg, 'num_workers', 0), cfg.batch_size)
+        dl_kwargs = dict(
             batch_size=cfg.batch_size,
             sampler=sampler,
-            num_workers=min(4, cfg.batch_size),
+            num_workers=n_workers,
             collate_fn=collate_unified,
-            pin_memory=True,
+            pin_memory=n_workers > 0,
             drop_last=True,
+            persistent_workers=n_workers > 0,
         )
+        if n_workers > 0:
+            dl_kwargs['prefetch_factor'] = 2
+        self.dataloader = DataLoader(self.unified_dataset, **dl_kwargs)
         
         self.data_iter = iter(self.dataloader)
         
@@ -332,7 +363,8 @@ class DriftingVLATrainer:
         projector_params = []
         dit_params = []
         
-        vlm_lr_scale = getattr(cfg, 'vlm_lr_scale', 0.1)
+        vlm_lr_scale = float(getattr(cfg, 'vlm_lr_scale', 0.1))
+        base_lr = float(cfg.learning_rate)
         
         for name, param in unwrapped.named_parameters():
             if not param.requires_grad:
@@ -348,21 +380,21 @@ class DriftingVLATrainer:
         if vlm_lora_params:
             param_groups.append({
                 'params': vlm_lora_params,
-                'lr': cfg.learning_rate * vlm_lr_scale,
+                'lr': base_lr * vlm_lr_scale,
                 'weight_decay': 0.0,
                 'name': 'vlm_lora',
             })
         if projector_params:
             param_groups.append({
                 'params': projector_params,
-                'lr': cfg.learning_rate * 0.5,
+                'lr': base_lr * 0.5,
                 'weight_decay': cfg.weight_decay,
                 'name': 'projector',
             })
         if dit_params:
             param_groups.append({
                 'params': dit_params,
-                'lr': cfg.learning_rate,
+                'lr': base_lr,
                 'weight_decay': cfg.weight_decay,
                 'name': 'dit',
             })
@@ -375,9 +407,10 @@ class DriftingVLATrainer:
         
         self.optimizer = torch.optim.AdamW(
             param_groups,
-            lr=cfg.learning_rate,
+            lr=base_lr,
             weight_decay=cfg.weight_decay,
             betas=(0.9, 0.95),
+            fused=True,
         )
         
         # Cosine LR schedule with warmup
@@ -474,6 +507,84 @@ class DriftingVLATrainer:
             return self.model.module
         return self.model
     
+    # Qwen3-VL-2B vision constants (from preprocessor_config.json & config.json)
+    _IMG_MEAN = torch.tensor([0.5, 0.5, 0.5])
+    _IMG_STD = torch.tensor([0.5, 0.5, 0.5])
+    _PATCH_SIZE = 16
+    _TEMPORAL_PATCH_SIZE = 2
+    _MERGE_SIZE = 2
+
+    def _process_images_on_gpu(self, batch: dict) -> dict:
+        """GPU-native Qwen3-VL image preprocessing.
+
+        Constants from Qwen3-VL-2B-Instruct preprocessor_config.json:
+          patch_size=16, temporal_patch_size=2, merge_size=2,
+          image_mean=[0.5,0.5,0.5], image_std=[0.5,0.5,0.5]
+
+        For 448×448 images: grid_h=448/16=28, grid_w=28, 784 patches/image.
+        Each patch channel dim: 3*2*16*16 = 1536.
+        """
+        images = batch['images'].to(self.device)  # [B, V, 3, H, W]
+        B, V, C, H, W = images.shape
+
+        if self._IMG_MEAN.device != self.device:
+            self._IMG_MEAN = self._IMG_MEAN.to(self.device)
+            self._IMG_STD = self._IMG_STD.to(self.device)
+
+        flat_images = images.reshape(B * V, C, H, W)
+        valid_mask = flat_images.abs().sum(dim=(1, 2, 3)) > 1.0
+        valid_images = flat_images[valid_mask]
+
+        if valid_images.shape[0] == 0:
+            valid_images = torch.zeros(1, C, H, W, device=self.device)
+
+        N = valid_images.shape[0]
+        P = self._PATCH_SIZE            # 16
+        tp = self._TEMPORAL_PATCH_SIZE  # 2
+        ms = self._MERGE_SIZE           # 2
+        grid_h = H // P                 # 448/16 = 28
+        grid_w = W // P                 # 448/16 = 28
+
+        mean = self._IMG_MEAN.view(1, 3, 1, 1)
+        std = self._IMG_STD.view(1, 3, 1, 1)
+        normed = (valid_images - mean) / std
+
+        normed = normed.unsqueeze(1).expand(-1, tp, -1, -1, -1)  # [N, 2, C, H, W]
+
+        patches = normed.reshape(
+            N, tp, C,
+            grid_h // ms, ms, P,
+            grid_w // ms, ms, P,
+        )
+
+        patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+
+        patches_per_image = grid_h * grid_w  # 28*28 = 784
+        c_patch = C * tp * P * P             # 3*2*16*16 = 1536
+        pixel_values = patches.reshape(N * patches_per_image, c_patch)
+
+        image_grid_thw = torch.tensor(
+            [[1, grid_h, grid_w]] * N,
+            dtype=torch.long, device=self.device,
+        )
+
+        languages = batch.get('language', [''] * B)
+        text_list = [lang if lang else 'describe the scene' for lang in languages]
+        text_inputs = self.vlm_processor.tokenizer(
+            text_list,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=128,
+        )
+
+        return {
+            'vlm_pixel_values': pixel_values,
+            'vlm_image_grid_thw': image_grid_thw,
+            'vlm_input_ids': text_inputs['input_ids'].to(self.device),
+            'vlm_attention_mask': text_inputs['attention_mask'].to(self.device),
+        }
+
     def training_step(self, batch: dict) -> dict:
         """Execute one training step."""
         cfg = self.config
@@ -494,16 +605,14 @@ class DriftingVLATrainer:
 
         B, T, D = actions_gt.shape
 
-        # Check for VLM ViT encoder inputs (from DataLoader workers)
+        # Check for VLM inputs
         vlm_input_ids = batch.get('vlm_input_ids', None)
         vlm_features = batch.get('vlm_features', None)
-        use_encoder = vlm_input_ids is not None
-        use_precomputed = vlm_features is not None and not use_encoder
+        use_precomputed = vlm_features is not None
 
         # Prepare forward kwargs
         fwd_kwargs = {}
-        if use_encoder:
-            # Path 1: Vision-encoder-only — ViT + text embed, skip LLM
+        if vlm_input_ids is not None:
             fwd_kwargs['vlm_input_ids'] = vlm_input_ids.to(self.device)
             fwd_kwargs['vlm_attention_mask'] = batch['vlm_attention_mask'].to(self.device)
             pv = batch.get('vlm_pixel_values', None)
@@ -512,20 +621,16 @@ class DriftingVLATrainer:
             thw = batch.get('vlm_image_grid_thw', None)
             if thw is not None:
                 fwd_kwargs['vlm_image_grid_thw'] = thw.to(self.device)
-
-            # Ensure VLM visual encoder is loaded
-            model = self._unwrapped_model()
-            if not model.vlm_backbone._loaded:
-                model.vlm_backbone.load_vlm(self.device)
         elif use_precomputed:
-            # Path 2: Pre-computed features — offline VLM
             fwd_kwargs['vlm_features'] = vlm_features.to(self.device)
             fwd_kwargs['vlm_pooled'] = batch['vlm_pooled'].to(self.device)
         else:
-            raise RuntimeError(
-                "No VLM inputs found in batch. Either set vlm_processor on dataset "
-                "or provide pre-computed VLM features."
-            )
+            fwd_kwargs = self._process_images_on_gpu(batch)
+
+        # Ensure VLM visual encoder is loaded
+        model = self._unwrapped_model()
+        if not model.vlm_backbone._loaded:
+            model.vlm_backbone.load_vlm(self.device)
 
         # Sample noise
         noise = torch.randn(B, T, cfg.noise_dim, device=self.device)
@@ -625,13 +730,13 @@ class DriftingVLATrainer:
                 self.model.parameters(), cfg.grad_clip
             )
             self.optimizer.step()
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             self.scheduler.step()
             self.ema.update()
             metrics['grad_norm'] = grad_norm.item()
 
-            # Track per-group gradient norms for E2 visualization
-            if self.is_main:
+            # Track per-group gradient norms (sampled at log_every to avoid GPU-CPU sync overhead)
+            if self.is_main and (self.global_step + 1) % cfg.log_every == 0:
                 for pg in self.optimizer.param_groups:
                     gname = pg.get('name', 'unknown')
                     gnorm = sum(p.grad.norm().item() ** 2 for p in pg['params']
@@ -881,9 +986,9 @@ class DriftingVLATrainer:
             cfg_scale = torch.ones(B, device=self.device) * 2.0  # Fixed CFG for eval
             
             # Build VLM forward kwargs (same logic as training_step)
-            fwd_kwargs = {}
             vlm_input_ids = batch.get('vlm_input_ids', None)
             vlm_features = batch.get('vlm_features', None)
+            fwd_kwargs = {}
             if vlm_input_ids is not None:
                 fwd_kwargs['vlm_input_ids'] = vlm_input_ids.to(self.device)
                 fwd_kwargs['vlm_attention_mask'] = batch['vlm_attention_mask'].to(self.device)
@@ -897,7 +1002,7 @@ class DriftingVLATrainer:
                 fwd_kwargs['vlm_features'] = vlm_features.to(self.device)
                 fwd_kwargs['vlm_pooled'] = batch['vlm_pooled'].to(self.device)
             else:
-                continue  # Skip batches without VLM inputs
+                fwd_kwargs = self._process_images_on_gpu(batch)
 
             with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=cfg.use_amp):
                 actions_pred = model(
@@ -1264,58 +1369,85 @@ def parse_args():
                         help='Resume from checkpoint path, or "latest" to auto-find')
     parser.add_argument('--gradient-checkpointing', action='store_true', default=False,
                         help='Enable gradient checkpointing on DiT (saves ~40%% VRAM)')
+    parser.add_argument('--no-vit-grad-ckpt', action='store_true', default=False,
+                        help='Disable ViT gradient checkpointing (faster but more VRAM)')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    args._defaults = {k: v for k, v in vars(parser.parse_args([])).items()}
+    return args
 
 
 def main():
     args = parse_args()
     
+    # Enable TF32 for faster matmul on Ampere/Hopper GPUs (no precision loss under bf16)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     # Initialize distributed if available
     if 'RANK' in os.environ:
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
         torch.cuda.set_device(local_rank)
-        # Disable NCCL P2P to avoid hangs on some GPU topologies (e.g., A40 PCIe)
         os.environ.setdefault('NCCL_P2P_DISABLE', '1')
         dist.init_process_group(backend='nccl')
         rank = dist.get_rank()
         if rank != 0:
             logging.getLogger().setLevel(logging.WARNING)
+            logging.getLogger('transformers').setLevel(logging.ERROR)
+            logging.getLogger('httpx').setLevel(logging.ERROR)
+            logging.getLogger('httpcore').setLevel(logging.ERROR)
+            os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
+            os.environ['TQDM_DISABLE'] = '1'
     
-    # Build config
+    # Build config: start with defaults, layer YAML on top, then CLI overrides
     config = TrainConfig()
-    
-    # Override with args
-    config.vlm_model_key = args.vlm
-    config.model_size = args.model_size
-    config.data_root = args.data_root
-    config.datasets = args.datasets
-    config.vlm_features_dir = args.vlm_features_dir
-    config.episodes_root = args.episodes_root
-    config.batch_size = args.batch_size
-    config.learning_rate = args.lr
-    config.max_steps = args.max_steps
-    config.loss_type = args.loss_type
-    config.grad_accumulation_steps = args.grad_accumulation
-    config.wandb_mode = args.wandb_mode
-    config.wandb_project = args.wandb_project
-    config.log_every = args.log_every
-    config.save_every = args.save_every
-    config.eval_every = args.eval_every
-    config.use_flash_attn = args.use_flash_attn
-    config.vlm_mode = args.vlm_mode
-    config.lora_r = args.lora_r
-    config.vlm_lr_scale = args.vlm_lr_scale
-    config.num_workers = args.num_workers
-    config.eval_batches = args.eval_batches
-    config.image_aug = args.image_aug
-    config.cond_mask_prob = args.cond_mask_prob
-    config.normalize_features = args.normalize_features
-    config.normalize_drift = args.normalize_drift
-    config.neg_source = args.neg_source
-    config.checkpoint_dir = args.checkpoint_dir
-    config.resume = args.resume
-    config.gradient_checkpointing = args.gradient_checkpointing
+
+    # Load YAML config file if provided
+    yaml_aliases = {'vlm': 'vlm_model_key'}
+    if args.config:
+        config_path = Path(args.config)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        with open(config_path) as f:
+            yaml_cfg = yaml.safe_load(f)
+        if yaml_cfg:
+            for key, val in yaml_cfg.items():
+                target = yaml_aliases.get(key, key)
+                if hasattr(config, target):
+                    setattr(config, target, val)
+                else:
+                    logger.warning(f"Unknown config key in YAML: {key}")
+
+    # CLI args override YAML only when explicitly provided on the command line.
+    # We detect explicit flags by comparing against argparse defaults.
+    cli_defaults = getattr(args, '_defaults', {})
+    cli_map = {
+        'vlm': 'vlm_model_key', 'model_size': 'model_size',
+        'data_root': 'data_root', 'datasets': 'datasets',
+        'vlm_features_dir': 'vlm_features_dir', 'episodes_root': 'episodes_root',
+        'batch_size': 'batch_size', 'lr': 'learning_rate',
+        'max_steps': 'max_steps', 'loss_type': 'loss_type',
+        'grad_accumulation': 'grad_accumulation_steps',
+        'wandb_mode': 'wandb_mode', 'wandb_project': 'wandb_project',
+        'log_every': 'log_every', 'save_every': 'save_every',
+        'eval_every': 'eval_every', 'use_flash_attn': 'use_flash_attn',
+        'vlm_mode': 'vlm_mode', 'lora_r': 'lora_r',
+        'vlm_lr_scale': 'vlm_lr_scale', 'num_workers': 'num_workers',
+        'eval_batches': 'eval_batches', 'image_aug': 'image_aug',
+        'cond_mask_prob': 'cond_mask_prob',
+        'normalize_features': 'normalize_features',
+        'normalize_drift': 'normalize_drift', 'neg_source': 'neg_source',
+        'checkpoint_dir': 'checkpoint_dir', 'resume': 'resume',
+        'gradient_checkpointing': 'gradient_checkpointing',
+    }
+    for cli_name, cfg_name in cli_map.items():
+        val = getattr(args, cli_name, None)
+        default_val = cli_defaults.get(cli_name)
+        if val != default_val:
+            setattr(config, cfg_name, val)
+
+    if getattr(args, 'no_vit_grad_ckpt', False):
+        config.vit_gradient_checkpointing = False
 
     # Model size configs
     size_cfgs = {

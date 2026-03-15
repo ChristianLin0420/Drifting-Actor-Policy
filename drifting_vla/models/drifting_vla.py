@@ -39,6 +39,7 @@ class DriftingVLAConfig:
     vlm_model_key: str = 'qwen3vl'
     vlm_freeze: bool = True
     vlm_use_lora: bool = False
+    vit_gradient_checkpointing: bool = True
 
     # DiT architecture
     hidden_dim: int = 768
@@ -109,6 +110,7 @@ class DriftingVLA(nn.Module):
             dit_hidden_dim=config.hidden_dim,
             freeze_base=config.vlm_freeze,
             use_lora=config.vlm_use_lora,
+            vit_gradient_checkpointing=config.vit_gradient_checkpointing,
         )
         self.vlm_backbone = VLMBackbone(vlm_config)
 

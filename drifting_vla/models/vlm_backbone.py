@@ -45,6 +45,7 @@ class VLMConfig:
     # ── Training mode ──
     freeze_base: bool = True              # Freeze VLM base weights
     use_lora: bool = False                # Apply LoRA to vision encoder
+    vit_gradient_checkpointing: bool = True  # Grad ckpt on ViT (saves VRAM, costs ~30% speed)
     lora_r: int = 16                      # LoRA rank
     lora_alpha: int = 32                  # LoRA scaling factor
     lora_dropout: float = 0.05
@@ -201,13 +202,15 @@ class VLMBackbone(nn.Module):
             # Apply LoRA only to the visual encoder
             self.vlm.model.visual = get_peft_model(visual_module, lora_config)
 
-            # Enable gradient checkpointing on visual encoder
-            try:
-                self.vlm.model.visual.enable_input_require_grads()
-                self.vlm.model.visual.gradient_checkpointing_enable()
-                logger.info("ViT gradient checkpointing enabled")
-            except Exception as e:
-                logger.warning(f"Could not enable ViT gradient checkpointing: {e}")
+            self.vlm.model.visual.enable_input_require_grads()
+            if self.config.vit_gradient_checkpointing:
+                try:
+                    self.vlm.model.visual.gradient_checkpointing_enable()
+                    logger.info("ViT gradient checkpointing enabled")
+                except Exception as e:
+                    logger.warning(f"Could not enable ViT gradient checkpointing: {e}")
+            else:
+                logger.info("ViT gradient checkpointing DISABLED (faster, more VRAM)")
 
             trainable = sum(p.numel() for p in self.vlm.model.visual.parameters() if p.requires_grad)
             total_vis = sum(p.numel() for p in self.vlm.model.visual.parameters())

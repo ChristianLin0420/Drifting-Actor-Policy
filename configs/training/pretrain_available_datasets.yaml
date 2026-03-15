@@ -1,0 +1,113 @@
+# =============================================================================
+# Available-Datasets Pretraining Configuration
+# =============================================================================
+# 40 verified working datasets (broken/missing removed).
+# Cluster: HPC H200 cluster (25a-hgpn nodes, 8× H200 per node)
+# Target:  15 nodes × 8 H200 = 120 GPUs
+# Global batch: 64/gpu × 1 accum × 120 GPUs = 7,680
+#
+# Launch:
+#   sbatch slurm_train.sh
+
+# Model
+model_size: 'base'
+vlm: 'qwen3vl'
+vlm_mode: 'lora'
+lora_r: 16
+vlm_lr_scale: 0.1
+
+# Data — 40 verified working datasets
+# Removed: aloha_static_fork (broken HDF5), aloha_mobile_cabinet (no metadata),
+#          aloha_mobile_chair (no metadata), dlr_sara_grid (no metadata)
+datasets:
+  # Original (5)
+  - aloha
+  - bc_z
+  - cmu_stretch
+  - nyu_franka
+  - dexora
+  # OXE batch 1 (7)
+  - kuka
+  - berkeley_fanuc
+  - cmu_play_fusion
+  - jaco_play
+  - austin_buds
+  - columbia_pusht
+  - nyu_door
+  # ALOHA Static (9)
+  - aloha_static_cups_open
+  - aloha_static_coffee
+  - aloha_static_pingpong
+  - aloha_static_pro_pencil
+  - aloha_static_candy
+  - aloha_static_battery
+  - aloha_static_screw
+  - aloha_static_towel
+  - aloha_static_ziploc
+  # ALOHA Mobile (3)
+  - aloha_mobile_wipe_wine
+  - aloha_mobile_elevator
+  - aloha_mobile_shrimp
+  # OXE batch 2 (16)
+  - berkeley_rpt
+  - toto
+  - stanford_robocook
+  - berkeley_mvp
+  - kaist_nonprehensile
+  - ucsd_pick_place
+  - ucsd_kitchen
+  - asu_table_top
+  - utokyo_pr2_fridge
+  - utokyo_pr2_tabletop
+  - utokyo_xarm_bimanual
+  - tokyo_u_lsmo
+  - dlr_sara_pour
+  - dlr_edan
+  - nyu_rot
+  - cmu_franka_exploration
+
+image_size: 448
+action_horizon: 64
+
+# Optimization — 64/gpu × 120 GPUs = 7,680 global batch
+# VLM image processing moved to GPU training loop (not in DataLoader workers).
+batch_size: 64
+grad_accumulation_steps: 1
+learning_rate: 1e-4
+weight_decay: 0.01
+warmup_steps: 2500
+max_steps: 100000
+grad_clip: 1.0
+
+# Drifting Loss (paper Table 8)
+loss_type: 'hybrid'
+drift_weight: 0.001
+temperatures: [0.02, 0.05, 0.2]
+n_pos_samples: 128
+n_neg_samples: 64
+neg_queue_size: 16384
+pos_queue_size: 8192
+normalize_features: true
+normalize_drift: true
+
+# EMA
+ema_decay: 0.9999
+
+# AMP
+use_amp: true
+amp_dtype: 'bfloat16'
+
+# DataLoader — workers do HDF5 I/O; VLM image processing is GPU-native.
+# /dev/shm is bind-mounted from host, so IPC is fine.
+num_workers: 4
+image_aug: true
+cond_mask_prob: 0.1
+
+# Logging
+log_every: 10
+eval_every: 2000
+save_every: 5000
+
+# WandB
+wandb_mode: 'online'
+wandb_project: 'drifting-vla-pretrain'
